@@ -137,6 +137,17 @@ class ChannelManager:
             except ImportError as e:
                 logger.warning("QQ channel not available: {}", e)
 
+        # LINE channel
+        if self.config.channels.line.enabled:
+            try:
+                from nanobot.channels.line import LineChannel
+                self.channels["line"] = LineChannel(
+                    self.config.channels.line, self.bus
+                )
+                logger.info("LINE channel enabled")
+            except ImportError as e:
+                logger.warning("LINE channel not available: {}", e)
+
         # Matrix channel
         if self.config.channels.matrix.enabled:
             try:

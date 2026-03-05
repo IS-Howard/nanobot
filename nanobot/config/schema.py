@@ -185,6 +185,19 @@ class QQConfig(Base):
     secret: str = ""  # 机器人密钥 (AppSecret) from q.qq.com
     allow_from: list[str] = Field(default_factory=list)  # Allowed user openids (empty = public access)
 
+
+class LineConfig(Base):
+    """LINE Messaging API channel configuration (webhook-based)."""
+
+    enabled: bool = False
+    channel_access_token: str = ""  # Long-lived channel access token from LINE Developers console
+    channel_secret: str = ""  # Channel secret for webhook signature verification
+    host: str = "0.0.0.0"  # Webhook server bind address
+    port: int = 18800  # Webhook server port
+    webhook_path: str = "/line/webhook"  # Webhook endpoint path
+    allow_from: list[str] = Field(default_factory=list)  # Allowed LINE user IDs
+
+
 class MatrixConfig(Base):
     """Matrix (Element) channel configuration."""
     enabled: bool = False
@@ -214,6 +227,7 @@ class ChannelsConfig(Base):
     email: EmailConfig = Field(default_factory=EmailConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
+    line: LineConfig = Field(default_factory=LineConfig)
     matrix: MatrixConfig = Field(default_factory=MatrixConfig)
 
 
