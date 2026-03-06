@@ -212,16 +212,17 @@ def _make_provider(config: Config):
     if provider_name == "openai_codex" or model.startswith("openai-codex/"):
         return OpenAICodexProvider(default_model=model)
 
-    # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
-    if provider_name == "custom":
-        return CustomProvider(
-            api_key=p.api_key if p else "no-key",
-            api_base=config.get_api_base(model) or "http://localhost:8000/v1",
-            default_model=model,
-        )
-
     from nanobot.providers.registry import find_by_name
     spec = find_by_name(provider_name)
+
+    # Direct OpenAI-compatible endpoints (custom, opencode, etc.) — bypass LiteLLM
+    if spec and spec.is_direct:
+        return CustomProvider(
+            api_key=p.api_key if p else "no-key",
+            api_base=config.get_api_base(model) or spec.default_api_base or "http://localhost:8000/v1",
+            default_model=model,
+            strip_prefix=spec.name if spec.is_gateway else "",
+        )
     if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
         console.print("[red]Error: No API key configured.[/red]")
         console.print("Set one in ~/.nanobot/config.json under providers section")

@@ -355,6 +355,40 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(),
     ),
 
+    # OpenCode Zen: AI gateway with curated coding models, OpenAI-compatible.
+    # Bypasses LiteLLM (is_direct) — talks directly to OpenAI-compatible endpoint.
+    ProviderSpec(
+        name="opencode",
+        keywords=("opencode", "zen"),
+        env_key="",
+        display_name="OpenCode Zen",
+        litellm_prefix="",
+        is_gateway=True,
+        is_direct=True,
+        detect_by_base_keyword="opencode",
+        default_api_base="https://opencode.ai/zen/v1",
+    ),
+
+    # === Standard providers (continued) ====================================
+
+    # NVIDIA NIM: needs "nvidia_nim/" prefix for LiteLLM routing.
+    ProviderSpec(
+        name="nvidia",
+        keywords=("nvidia", "nvidia_nim", "nemotron"),
+        env_key="NVIDIA_NIM_API_KEY",
+        display_name="NVIDIA NIM",
+        litellm_prefix="nvidia_nim",
+        skip_prefixes=("nvidia_nim/",),
+        env_extras=(),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="nvidia",
+        default_api_base="https://integrate.api.nvidia.com/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+
     # === Local deployment (matched by config key, NOT by api_base) =========
 
     # vLLM / any OpenAI-compatible local server.

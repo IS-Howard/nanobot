@@ -12,16 +12,24 @@ from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 class CustomProvider(LLMProvider):
 
-    def __init__(self, api_key: str = "no-key", api_base: str = "http://localhost:8000/v1", default_model: str = "default"):
+    def __init__(self, api_key: str = "no-key", api_base: str = "http://localhost:8000/v1",
+                 default_model: str = "default", strip_prefix: str = ""):
         super().__init__(api_key, api_base)
         self.default_model = default_model
+        self._strip_prefix = strip_prefix + "/" if strip_prefix else ""
         self._client = AsyncOpenAI(api_key=api_key, base_url=api_base)
+
+    def _resolve_model(self, model: str | None) -> str:
+        name = model or self.default_model
+        if self._strip_prefix and name.startswith(self._strip_prefix):
+            return name[len(self._strip_prefix):]
+        return name
 
     async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
                    model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
                    reasoning_effort: str | None = None) -> LLMResponse:
         kwargs: dict[str, Any] = {
-            "model": model or self.default_model,
+            "model": self._resolve_model(model),
             "messages": self._sanitize_empty_content(messages),
             "max_tokens": max(1, max_tokens),
             "temperature": temperature,
