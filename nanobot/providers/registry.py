@@ -103,156 +103,20 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         supports_prompt_caching=True,
     ),
 
-    # AiHubMix: global gateway, OpenAI-compatible interface.
-    # strip_model_prefix=True: it doesn't understand "anthropic/claude-3",
-    # so we strip to bare "claude-3" then re-prefix as "openai/claude-3".
+    # OpenCode Zen: free model gateway, direct OpenAI-compatible API
     ProviderSpec(
-        name="aihubmix",
-        keywords=("aihubmix",),
-        env_key="OPENAI_API_KEY",           # OpenAI-compatible
-        display_name="AiHubMix",
-        litellm_prefix="openai",            # → openai/{model}
-        skip_prefixes=(),
-        env_extras=(),
+        name="opencode",
+        keywords=("opencode", "zen"),
+        env_key="",
+        display_name="OpenCode Zen",
+        litellm_prefix="",
         is_gateway=True,
-        is_local=False,
-        detect_by_key_prefix="",
-        detect_by_base_keyword="aihubmix",
-        default_api_base="https://aihubmix.com/v1",
-        strip_model_prefix=True,            # anthropic/claude-3 → claude-3 → openai/claude-3
-        model_overrides=(),
-    ),
-
-    # SiliconFlow (硅基流动): OpenAI-compatible gateway, model names keep org prefix
-    ProviderSpec(
-        name="siliconflow",
-        keywords=("siliconflow",),
-        env_key="OPENAI_API_KEY",
-        display_name="SiliconFlow",
-        litellm_prefix="openai",
-        skip_prefixes=(),
-        env_extras=(),
-        is_gateway=True,
-        is_local=False,
-        detect_by_key_prefix="",
-        detect_by_base_keyword="siliconflow",
-        default_api_base="https://api.siliconflow.cn/v1",
-        strip_model_prefix=False,
-        model_overrides=(),
-    ),
-
-    # VolcEngine (火山引擎): OpenAI-compatible gateway
-    ProviderSpec(
-        name="volcengine",
-        keywords=("volcengine", "volces", "ark"),
-        env_key="OPENAI_API_KEY",
-        display_name="VolcEngine",
-        litellm_prefix="volcengine",
-        skip_prefixes=(),
-        env_extras=(),
-        is_gateway=True,
-        is_local=False,
-        detect_by_key_prefix="",
-        detect_by_base_keyword="volces",
-        default_api_base="https://ark.cn-beijing.volces.com/api/v3",
-        strip_model_prefix=False,
-        model_overrides=(),
+        is_direct=True,
+        detect_by_base_keyword="opencode",
+        default_api_base="https://opencode.ai/zen/v1",
     ),
 
     # === Standard providers (matched by model-name keywords) ===============
-
-    # Anthropic: LiteLLM recognizes "claude-*" natively, no prefix needed.
-    ProviderSpec(
-        name="anthropic",
-        keywords=("anthropic", "claude"),
-        env_key="ANTHROPIC_API_KEY",
-        display_name="Anthropic",
-        litellm_prefix="",
-        skip_prefixes=(),
-        env_extras=(),
-        is_gateway=False,
-        is_local=False,
-        detect_by_key_prefix="",
-        detect_by_base_keyword="",
-        default_api_base="",
-        strip_model_prefix=False,
-        model_overrides=(),
-        supports_prompt_caching=True,
-    ),
-
-    # OpenAI: LiteLLM recognizes "gpt-*" natively, no prefix needed.
-    ProviderSpec(
-        name="openai",
-        keywords=("openai", "gpt"),
-        env_key="OPENAI_API_KEY",
-        display_name="OpenAI",
-        litellm_prefix="",
-        skip_prefixes=(),
-        env_extras=(),
-        is_gateway=False,
-        is_local=False,
-        detect_by_key_prefix="",
-        detect_by_base_keyword="",
-        default_api_base="",
-        strip_model_prefix=False,
-        model_overrides=(),
-    ),
-
-    # OpenAI Codex: uses OAuth, not API key.
-    ProviderSpec(
-        name="openai_codex",
-        keywords=("openai-codex",),
-        env_key="",                         # OAuth-based, no API key
-        display_name="OpenAI Codex",
-        litellm_prefix="",                  # Not routed through LiteLLM
-        skip_prefixes=(),
-        env_extras=(),
-        is_gateway=False,
-        is_local=False,
-        detect_by_key_prefix="",
-        detect_by_base_keyword="codex",
-        default_api_base="https://chatgpt.com/backend-api",
-        strip_model_prefix=False,
-        model_overrides=(),
-        is_oauth=True,                      # OAuth-based authentication
-    ),
-
-    # Github Copilot: uses OAuth, not API key.
-    ProviderSpec(
-        name="github_copilot",
-        keywords=("github_copilot", "copilot"),
-        env_key="",                         # OAuth-based, no API key
-        display_name="Github Copilot",
-        litellm_prefix="github_copilot",   # github_copilot/model → github_copilot/model
-        skip_prefixes=("github_copilot/",),
-        env_extras=(),
-        is_gateway=False,
-        is_local=False,
-        detect_by_key_prefix="",
-        detect_by_base_keyword="",
-        default_api_base="",
-        strip_model_prefix=False,
-        model_overrides=(),
-        is_oauth=True,                      # OAuth-based authentication
-    ),
-
-    # DeepSeek: needs "deepseek/" prefix for LiteLLM routing.
-    ProviderSpec(
-        name="deepseek",
-        keywords=("deepseek",),
-        env_key="DEEPSEEK_API_KEY",
-        display_name="DeepSeek",
-        litellm_prefix="deepseek",          # deepseek-chat → deepseek/deepseek-chat
-        skip_prefixes=("deepseek/",),       # avoid double-prefix
-        env_extras=(),
-        is_gateway=False,
-        is_local=False,
-        detect_by_key_prefix="",
-        detect_by_base_keyword="",
-        default_api_base="",
-        strip_model_prefix=False,
-        model_overrides=(),
-    ),
 
     # Gemini: needs "gemini/" prefix for LiteLLM.
     ProviderSpec(
@@ -272,105 +136,6 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(),
     ),
 
-    # Zhipu: LiteLLM uses "zai/" prefix.
-    # Also mirrors key to ZHIPUAI_API_KEY (some LiteLLM paths check that).
-    # skip_prefixes: don't add "zai/" when already routed via gateway.
-    ProviderSpec(
-        name="zhipu",
-        keywords=("zhipu", "glm", "zai"),
-        env_key="ZAI_API_KEY",
-        display_name="Zhipu AI",
-        litellm_prefix="zai",              # glm-4 → zai/glm-4
-        skip_prefixes=("zhipu/", "zai/", "openrouter/", "hosted_vllm/"),
-        env_extras=(
-            ("ZHIPUAI_API_KEY", "{api_key}"),
-        ),
-        is_gateway=False,
-        is_local=False,
-        detect_by_key_prefix="",
-        detect_by_base_keyword="",
-        default_api_base="",
-        strip_model_prefix=False,
-        model_overrides=(),
-    ),
-
-    # DashScope: Qwen models, needs "dashscope/" prefix.
-    ProviderSpec(
-        name="dashscope",
-        keywords=("qwen", "dashscope"),
-        env_key="DASHSCOPE_API_KEY",
-        display_name="DashScope",
-        litellm_prefix="dashscope",         # qwen-max → dashscope/qwen-max
-        skip_prefixes=("dashscope/", "openrouter/"),
-        env_extras=(),
-        is_gateway=False,
-        is_local=False,
-        detect_by_key_prefix="",
-        detect_by_base_keyword="",
-        default_api_base="",
-        strip_model_prefix=False,
-        model_overrides=(),
-    ),
-
-    # Moonshot: Kimi models, needs "moonshot/" prefix.
-    # LiteLLM requires MOONSHOT_API_BASE env var to find the endpoint.
-    # Kimi K2.5 API enforces temperature >= 1.0.
-    ProviderSpec(
-        name="moonshot",
-        keywords=("moonshot", "kimi"),
-        env_key="MOONSHOT_API_KEY",
-        display_name="Moonshot",
-        litellm_prefix="moonshot",          # kimi-k2.5 → moonshot/kimi-k2.5
-        skip_prefixes=("moonshot/", "openrouter/"),
-        env_extras=(
-            ("MOONSHOT_API_BASE", "{api_base}"),
-        ),
-        is_gateway=False,
-        is_local=False,
-        detect_by_key_prefix="",
-        detect_by_base_keyword="",
-        default_api_base="https://api.moonshot.ai/v1",   # intl; use api.moonshot.cn for China
-        strip_model_prefix=False,
-        model_overrides=(
-            ("kimi-k2.5", {"temperature": 1.0}),
-        ),
-    ),
-
-    # MiniMax: needs "minimax/" prefix for LiteLLM routing.
-    # Uses OpenAI-compatible API at api.minimax.io/v1.
-    ProviderSpec(
-        name="minimax",
-        keywords=("minimax",),
-        env_key="MINIMAX_API_KEY",
-        display_name="MiniMax",
-        litellm_prefix="minimax",            # MiniMax-M2.1 → minimax/MiniMax-M2.1
-        skip_prefixes=("minimax/", "openrouter/"),
-        env_extras=(),
-        is_gateway=False,
-        is_local=False,
-        detect_by_key_prefix="",
-        detect_by_base_keyword="",
-        default_api_base="https://api.minimax.io/v1",
-        strip_model_prefix=False,
-        model_overrides=(),
-    ),
-
-    # OpenCode Zen: AI gateway with curated coding models, OpenAI-compatible.
-    # Bypasses LiteLLM (is_direct) — talks directly to OpenAI-compatible endpoint.
-    ProviderSpec(
-        name="opencode",
-        keywords=("opencode", "zen"),
-        env_key="",
-        display_name="OpenCode Zen",
-        litellm_prefix="",
-        is_gateway=True,
-        is_direct=True,
-        detect_by_base_keyword="opencode",
-        default_api_base="https://opencode.ai/zen/v1",
-    ),
-
-    # === Standard providers (continued) ====================================
-
     # NVIDIA NIM: needs "nvidia_nim/" prefix for LiteLLM routing.
     ProviderSpec(
         name="nvidia",
@@ -385,27 +150,6 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_key_prefix="",
         detect_by_base_keyword="nvidia",
         default_api_base="https://integrate.api.nvidia.com/v1",
-        strip_model_prefix=False,
-        model_overrides=(),
-    ),
-
-    # === Local deployment (matched by config key, NOT by api_base) =========
-
-    # vLLM / any OpenAI-compatible local server.
-    # Detected when config key is "vllm" (provider_name="vllm").
-    ProviderSpec(
-        name="vllm",
-        keywords=("vllm",),
-        env_key="HOSTED_VLLM_API_KEY",
-        display_name="vLLM/Local",
-        litellm_prefix="hosted_vllm",      # Llama-3-8B → hosted_vllm/Llama-3-8B
-        skip_prefixes=(),
-        env_extras=(),
-        is_gateway=False,
-        is_local=True,
-        detect_by_key_prefix="",
-        detect_by_base_keyword="",
-        default_api_base="",                # user must provide in config
         strip_model_prefix=False,
         model_overrides=(),
     ),
