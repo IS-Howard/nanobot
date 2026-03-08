@@ -233,6 +233,14 @@ class AgentLoop:
         while iteration < self.max_iterations:
             iteration += 1
 
+            msg_chars = sum(
+                len(m.get("content") or "") if isinstance(m.get("content"), str)
+                else sum(len(c.get("text", "")) for c in m["content"] if isinstance(c, dict))
+                if isinstance(m.get("content"), list) else 0
+                for m in messages
+            )
+            logger.info("LLM request: ~{} chars, {} messages ({})", msg_chars, len(messages), active_model)
+
             response = await active_provider.chat(
                 messages=messages,
                 tools=tool_defs,
@@ -241,13 +249,6 @@ class AgentLoop:
                 max_tokens=self.max_tokens,
                 reasoning_effort=self.reasoning_effort,
             )
-            u = response.usage
-            if u:
-                logger.info(
-                    "Tokens: {} prompt + {} completion = {} ({})",
-                    u.get("prompt_tokens", "?"), u.get("completion_tokens", "?"),
-                    u.get("total_tokens", "?"), active_model,
-                )
 
             if response.has_tool_calls:
                 if on_progress:
