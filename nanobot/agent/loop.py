@@ -241,6 +241,13 @@ class AgentLoop:
                 max_tokens=self.max_tokens,
                 reasoning_effort=self.reasoning_effort,
             )
+            u = response.usage
+            if u:
+                logger.info(
+                    "Tokens: {} prompt + {} completion = {} ({})",
+                    u.get("prompt_tokens", "?"), u.get("completion_tokens", "?"),
+                    u.get("total_tokens", "?"), active_model,
+                )
 
             if response.has_tool_calls:
                 if on_progress:
