@@ -55,6 +55,7 @@ class AgentLoop:
         workspace: Path,
         model: str | None = None,
         tool_model: str = "",
+        tool_provider: LLMProvider | None = None,
         auto_escalate: bool = True,
         max_iterations: int = 40,
         temperature: float = 0.1,
@@ -78,6 +79,7 @@ class AgentLoop:
         self.workspace = workspace
         self.model = model or provider.get_default_model()
         self.tool_model = tool_model
+        self.tool_provider = tool_provider
         self.auto_escalate = auto_escalate
         self.max_iterations = max_iterations
         self.temperature = temperature
@@ -196,12 +198,14 @@ class AgentLoop:
         final_content = None
         tools_used: list[str] = []
         active_model = model or self.model
+        # Use tool_provider when switching to tool_model (may need different provider type)
+        active_provider = (self.tool_provider or self.provider) if (model and model == self.tool_model and self.tool_provider) else self.provider
         tool_defs = self.tools.get_definitions() if use_tools else None
 
         while iteration < self.max_iterations:
             iteration += 1
 
-            response = await self.provider.chat(
+            response = await active_provider.chat(
                 messages=messages,
                 tools=tool_defs,
                 model=active_model,

@@ -196,19 +196,17 @@ def onboard():
 
 
 
-def _make_provider(config: Config):
-    """Create the appropriate LLM provider from config."""
+def _make_provider_for_model(config: Config, model: str):
+    """Create the appropriate LLM provider for a specific model."""
     from nanobot.providers.custom_provider import CustomProvider
     from nanobot.providers.litellm_provider import LiteLLMProvider
+    from nanobot.providers.registry import find_by_name
 
-    model = config.agents.defaults.model
     provider_name = config.get_provider_name(model)
     p = config.get_provider(model)
-
-    from nanobot.providers.registry import find_by_name
     spec = find_by_name(provider_name)
 
-    # Direct OpenAI-compatible endpoints (custom, etc.) — bypass LiteLLM
+    # Direct OpenAI-compatible endpoints (custom, opencode, etc.) — bypass LiteLLM
     if spec and spec.is_direct:
         return CustomProvider(
             api_key=p.api_key if p else "no-key",
@@ -228,6 +226,22 @@ def _make_provider(config: Config):
         extra_headers=p.extra_headers if p else None,
         provider_name=provider_name,
     )
+
+
+def _make_provider(config: Config):
+    """Create the main provider and optional tool_provider."""
+    model = config.agents.defaults.model
+    tool_model = config.agents.defaults.tool_model
+    provider = _make_provider_for_model(config, model)
+
+    # Build a separate provider for tool_model if it needs a different provider type
+    tool_provider = None
+    if tool_model:
+        tp = _make_provider_for_model(config, tool_model)
+        if type(tp) is not type(provider):
+            tool_provider = tp
+
+    return provider, tool_provider
 
 
 # ============================================================================
@@ -259,7 +273,7 @@ def gateway(
     config = load_config()
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
-    provider = _make_provider(config)
+    provider, tool_provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
 
     # Connect PostgreSQL storage if configured
@@ -284,6 +298,7 @@ def gateway(
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
         tool_model=config.agents.defaults.tool_model,
+        tool_provider=tool_provider,
         auto_escalate=config.agents.defaults.auto_escalate,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
@@ -453,7 +468,7 @@ def agent(
     sync_workspace_templates(config.workspace_path)
 
     bus = MessageBus()
-    provider = _make_provider(config)
+    provider, tool_provider = _make_provider(config)
 
     # Create cron service for tool usage (no callback needed for CLI unless running)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
@@ -470,6 +485,7 @@ def agent(
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
         tool_model=config.agents.defaults.tool_model,
+        tool_provider=tool_provider,
         auto_escalate=config.agents.defaults.auto_escalate,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
