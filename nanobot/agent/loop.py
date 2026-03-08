@@ -392,7 +392,12 @@ class AgentLoop:
             for m in all_msgs[skip:]:
                 role = m.get("role")
                 content = m.get("content", "")
-                if role == "assistant" and not content and not m.get("tool_calls"):
+                # Skip intermediate tool messages
+                if role == "tool":
+                    continue
+                if role == "assistant" and m.get("tool_calls"):
+                    continue
+                if role == "assistant" and not content:
                     continue
                 if role == "user" and isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
                     parts = content.split("\n\n", 1)
@@ -400,8 +405,6 @@ class AgentLoop:
                         m = {**m, "content": parts[1]}
                     else:
                         continue
-                if role == "tool" and isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
-                    m = {**m, "content": content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"}
                 new_msgs.append(m)
             if new_msgs:
                 await self.storage.save_messages(key, new_msgs)
@@ -565,18 +568,27 @@ class AgentLoop:
         )
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
-        """Save new-turn messages into session, truncating large tool results."""
+        """Save user messages and final assistant reply into session.
+
+        Intermediate tool round-trips (assistant with tool_calls, tool results)
+        are internal to a single turn and not persisted — avoids breaking
+        models without function-calling support.
+        """
         from datetime import datetime
         for m in messages[skip:]:
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
-            if role == "assistant" and not content and not entry.get("tool_calls"):
-                continue  # skip empty assistant messages — they poison session context
-            if role == "tool" and isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
-                entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
-            elif role == "user":
+
+            # Skip intermediate tool messages
+            if role == "tool":
+                continue
+            if role == "assistant" and entry.get("tool_calls"):
+                continue
+            if role == "assistant" and not content:
+                continue
+
+            if role == "user":
                 if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
-                    # Strip the runtime-context prefix, keep only the user text.
                     parts = content.split("\n\n", 1)
                     if len(parts) > 1 and parts[1].strip():
                         entry["content"] = parts[1]
@@ -586,7 +598,7 @@ class AgentLoop:
                     filtered = []
                     for c in content:
                         if c.get("type") == "text" and isinstance(c.get("text"), str) and c["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
-                            continue  # Strip runtime context from multimodal messages
+                            continue
                         if (c.get("type") == "image_url"
                                 and c.get("image_url", {}).get("url", "").startswith("data:image/")):
                             filtered.append({"type": "text", "text": "[image]"})
