@@ -234,11 +234,14 @@ def _make_provider(config: Config):
     tool_model = config.agents.defaults.tool_model
     provider = _make_provider_for_model(config, model)
 
-    # Build a separate provider for tool_model if it needs a different provider type
+    # Build a separate provider for tool_model if it resolves to a different provider
     tool_provider = None
     if tool_model:
         tp = _make_provider_for_model(config, tool_model)
-        if type(tp) is not type(provider):
+        # Always use separate provider when api_key or api_base differ
+        if (type(tp) is not type(provider)
+                or tp.api_key != provider.api_key
+                or tp.api_base != provider.api_base):
             tool_provider = tp
 
     return provider, tool_provider
