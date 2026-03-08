@@ -44,7 +44,7 @@ class AgentLoop:
     5. Sends responses back
     """
 
-    _TOOL_RESULT_MAX_CHARS = 500
+    _TOOL_RESULT_MAX_CHARS = 2000
 
     _NEED_TOOLS_RE = re.compile(r"<need_tools>(.*?)</need_tools>", re.DOTALL)
 
@@ -138,6 +138,28 @@ class AgentLoop:
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
 
+        # File analysis tools (require PostgreSQL storage)
+        if self.storage:
+            from nanobot.agent.tools.files import FileAnalysisTool, FileInfoTool
+            self.tools.register(FileInfoTool(storage=self.storage))
+            analysis_provider = self.tool_provider or self.provider
+            analysis_model = self.tool_model or self.model
+            transcription = None
+            try:
+                import os
+                groq_key = os.environ.get("GROQ_API_KEY")
+                if groq_key:
+                    from nanobot.providers.transcription import GroqTranscriptionProvider
+                    transcription = GroqTranscriptionProvider(api_key=groq_key)
+            except ImportError:
+                pass
+            self.tools.register(FileAnalysisTool(
+                storage=self.storage,
+                provider=analysis_provider,
+                model=analysis_model,
+                transcription=transcription,
+            ))
+
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
         if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
@@ -166,6 +188,12 @@ class AgentLoop:
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+        # File tools need session_key
+        session_key = f"{channel}:{chat_id}"
+        for name in ("get_file_info", "analyze_file"):
+            if tool := self.tools.get(name):
+                if hasattr(tool, "set_context"):
+                    tool.set_context(session_key)
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:

@@ -23,9 +23,17 @@ class ChannelManager:
     - Route outbound messages
     """
 
-    def __init__(self, config: Config, bus: MessageBus):
+    def __init__(
+        self,
+        config: Config,
+        bus: MessageBus,
+        storage: Any | None = None,
+        max_files_per_session: int = 2,
+    ):
         self.config = config
         self.bus = bus
+        self._storage = storage
+        self._max_files = max_files_per_session
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
 
@@ -39,7 +47,9 @@ class ChannelManager:
             try:
                 from nanobot.channels.line import LineChannel
                 self.channels["line"] = LineChannel(
-                    self.config.channels.line, self.bus
+                    self.config.channels.line, self.bus,
+                    storage=self._storage,
+                    max_files_per_session=self._max_files,
                 )
                 logger.info("LINE channel enabled")
             except ImportError as e:
