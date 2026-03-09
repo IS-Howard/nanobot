@@ -329,7 +329,10 @@ class AgentLoop:
                 is_busy = (msg.session_key in self._busy_sessions
                            if self.parallel else bool(self._busy_sessions))
                 if is_busy:
+                    logger.info("Session {} is busy, sending busy notification", msg.session_key)
                     await self._send_busy_notification(msg)
+                # Mark session as busy before dispatching to avoid race conditions
+                self._busy_sessions.add(msg.session_key)
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(msg.session_key, []).append(task)
                 task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
@@ -359,7 +362,6 @@ class AgentLoop:
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message under lock, coalescing queued messages from the same user."""
         async with self._get_lock(msg.session_key):
-            self._busy_sessions.add(msg.session_key)
             try:
                 msg = self._coalesce(msg)
                 response = await self._process_message(msg)

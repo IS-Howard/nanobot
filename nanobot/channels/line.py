@@ -465,6 +465,7 @@ class LineChannel(BaseChannel):
 
     async def show_busy(self, chat_id: str) -> None:
         """Show LINE loading animation when agent is busy."""
+        logger.debug("LINE show_busy for chat_id={}", chat_id)
         await self._show_loading(chat_id)
 
     async def _show_loading(self, chat_id: str) -> None:
