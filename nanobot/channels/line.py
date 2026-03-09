@@ -474,7 +474,7 @@ class LineChannel(BaseChannel):
             return
         try:
             resp = await self._http.post(
-                f"{LINE_API_BASE}/chat/loading",
+                f"{LINE_API_BASE}/chat/loading/start",
                 headers=self._auth_headers,
                 json={"chatId": chat_id, "loadingSeconds": 30},
             )
