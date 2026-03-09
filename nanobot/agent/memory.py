@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -13,28 +12,6 @@ from nanobot.utils.helpers import ensure_dir, safe_filename
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
     from nanobot.session.manager import Session
-
-
-_SAVE_MEMORY_TOOL = [
-    {
-        "type": "function",
-        "function": {
-            "name": "save_memory",
-            "description": "Save the memory consolidation result to persistent storage.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "memory_update": {
-                        "type": "string",
-                        "description": "Full updated long-term memory as markdown. Include all existing "
-                        "facts plus new ones. Return unchanged if nothing new.",
-                    },
-                },
-                "required": ["memory_update"],
-            },
-        },
-    }
-]
 
 
 class MemoryStore:
@@ -74,8 +51,9 @@ class MemoryStore:
         sender_id: str,
         topic: str | None = None,
     ) -> bool:
-        """Consolidate session messages into per-user MEMORY.md via LLM tool call.
+        """Consolidate session messages into per-user MEMORY.md via LLM.
 
+        The LLM returns the updated memory as plain text (no tool calling).
         Returns True on success, False on failure.
         """
         if not session.messages:
@@ -94,9 +72,12 @@ class MemoryStore:
 
         topic_instruction = ""
         if topic:
-            topic_instruction = f"\n\nFocus the consolidation on: {topic}. Extract and preserve details related to this topic while keeping existing memory intact."
+            topic_instruction = f"\nFocus on: {topic}. Extract and preserve details related to this topic while keeping existing memory intact."
 
-        prompt = f"""Process this conversation and call the save_memory tool with your consolidation.{topic_instruction}
+        prompt = f"""Consolidate the conversation below into an updated long-term memory document.
+Return ONLY the updated markdown memory — no explanation, no preamble, no code fences.
+Include all existing facts plus any new ones from the conversation.
+If nothing new is worth remembering, return the existing memory unchanged.{topic_instruction}
 
 ## Current Long-term Memory
 {current_memory or "(empty)"}
@@ -107,29 +88,19 @@ class MemoryStore:
         try:
             response = await provider.chat(
                 messages=[
-                    {"role": "system", "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."},
+                    {"role": "system", "content": "You are a memory consolidation agent. Return ONLY the updated memory as markdown. No explanation, no wrapping."},
                     {"role": "user", "content": prompt},
                 ],
-                tools=_SAVE_MEMORY_TOOL,
                 model=model,
             )
 
-            if not response.has_tool_calls:
-                logger.warning("Memory consolidation: LLM did not call save_memory, skipping")
+            update = (response.content or "").strip()
+            if not update:
+                logger.warning("Memory consolidation: LLM returned empty response")
                 return False
 
-            args = response.tool_calls[0].arguments
-            if isinstance(args, str):
-                args = json.loads(args)
-            if not isinstance(args, dict):
-                logger.warning("Memory consolidation: unexpected arguments type {}", type(args).__name__)
-                return False
-
-            if update := args.get("memory_update"):
-                if not isinstance(update, str):
-                    update = json.dumps(update, ensure_ascii=False)
-                if update != current_memory:
-                    self.write_user_memory(sender_id, update)
+            if update != current_memory.strip():
+                self.write_user_memory(sender_id, update)
 
             logger.info("Memory consolidation done for user {}", sender_id)
             return True
