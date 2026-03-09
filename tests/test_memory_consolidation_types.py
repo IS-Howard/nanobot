@@ -1,8 +1,7 @@
 """Test MemoryStore.consolidate() handles non-string tool call arguments.
 
-Regression test for https://github.com/HKUDS/nanobot/issues/1042
-When memory consolidation receives dict values instead of strings from the LLM
-tool call response, it should serialize them to JSON instead of raising TypeError.
+Regression test: when memory consolidation receives dict values instead of strings
+from the LLM tool call response, it should serialize them to JSON instead of raising TypeError.
 """
 
 import json
@@ -15,18 +14,17 @@ from nanobot.agent.memory import MemoryStore
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 
 
-def _make_session(message_count: int = 30, memory_window: int = 50):
+def _make_session(message_count: int = 10):
     """Create a mock session with messages."""
     session = MagicMock()
     session.messages = [
         {"role": "user", "content": f"msg{i}", "timestamp": "2026-01-01 00:00"}
         for i in range(message_count)
     ]
-    session.last_consolidated = 0
     return session
 
 
-def _make_tool_response(history_entry, memory_update):
+def _make_tool_response(memory_update):
     """Create an LLMResponse with a save_memory tool call."""
     return LLMResponse(
         content=None,
@@ -34,10 +32,7 @@ def _make_tool_response(history_entry, memory_update):
             ToolCallRequest(
                 id="call_1",
                 name="save_memory",
-                arguments={
-                    "history_entry": history_entry,
-                    "memory_update": memory_update,
-                },
+                arguments={"memory_update": memory_update},
             )
         ],
     )
@@ -53,41 +48,34 @@ class TestMemoryConsolidationTypeHandling:
         provider = AsyncMock()
         provider.chat = AsyncMock(
             return_value=_make_tool_response(
-                history_entry="[2026-01-01] User discussed testing.",
                 memory_update="# Memory\nUser likes testing.",
             )
         )
-        session = _make_session(message_count=60)
+        session = _make_session(message_count=5)
 
-        result = await store.consolidate(session, provider, "test-model", memory_window=50)
+        result = await store.consolidate(session, provider, "test-model", sender_id="user1")
 
         assert result is True
-        assert store.history_file.exists()
-        assert "[2026-01-01] User discussed testing." in store.history_file.read_text()
-        assert "User likes testing." in store.memory_file.read_text()
+        memory_path = store._user_memory_path("user1")
+        assert memory_path.exists()
+        assert "User likes testing." in memory_path.read_text()
 
     @pytest.mark.asyncio
     async def test_dict_arguments_serialized_to_json(self, tmp_path: Path) -> None:
-        """Issue #1042: LLM returns dict instead of string — must not raise TypeError."""
+        """LLM returns dict instead of string — must not raise TypeError."""
         store = MemoryStore(tmp_path)
         provider = AsyncMock()
         provider.chat = AsyncMock(
             return_value=_make_tool_response(
-                history_entry={"timestamp": "2026-01-01", "summary": "User discussed testing."},
                 memory_update={"facts": ["User likes testing"], "topics": ["testing"]},
             )
         )
-        session = _make_session(message_count=60)
+        session = _make_session(message_count=5)
 
-        result = await store.consolidate(session, provider, "test-model", memory_window=50)
+        result = await store.consolidate(session, provider, "test-model", sender_id="user1")
 
         assert result is True
-        assert store.history_file.exists()
-        history_content = store.history_file.read_text()
-        parsed = json.loads(history_content.strip())
-        assert parsed["summary"] == "User discussed testing."
-
-        memory_content = store.memory_file.read_text()
+        memory_content = store._user_memory_path("user1").read_text()
         parsed_mem = json.loads(memory_content)
         assert "User likes testing" in parsed_mem["facts"]
 
@@ -97,7 +85,6 @@ class TestMemoryConsolidationTypeHandling:
         store = MemoryStore(tmp_path)
         provider = AsyncMock()
 
-        # Simulate arguments being a JSON string (not yet parsed)
         response = LLMResponse(
             content=None,
             tool_calls=[
@@ -105,19 +92,18 @@ class TestMemoryConsolidationTypeHandling:
                     id="call_1",
                     name="save_memory",
                     arguments=json.dumps({
-                        "history_entry": "[2026-01-01] User discussed testing.",
                         "memory_update": "# Memory\nUser likes testing.",
                     }),
                 )
             ],
         )
         provider.chat = AsyncMock(return_value=response)
-        session = _make_session(message_count=60)
+        session = _make_session(message_count=5)
 
-        result = await store.consolidate(session, provider, "test-model", memory_window=50)
+        result = await store.consolidate(session, provider, "test-model", sender_id="user1")
 
         assert result is True
-        assert "User discussed testing." in store.history_file.read_text()
+        assert "User likes testing." in store._user_memory_path("user1").read_text()
 
     @pytest.mark.asyncio
     async def test_no_tool_call_returns_false(self, tmp_path: Path) -> None:
@@ -127,21 +113,64 @@ class TestMemoryConsolidationTypeHandling:
         provider.chat = AsyncMock(
             return_value=LLMResponse(content="I summarized the conversation.", tool_calls=[])
         )
-        session = _make_session(message_count=60)
+        session = _make_session(message_count=5)
 
-        result = await store.consolidate(session, provider, "test-model", memory_window=50)
+        result = await store.consolidate(session, provider, "test-model", sender_id="user1")
 
         assert result is False
-        assert not store.history_file.exists()
 
     @pytest.mark.asyncio
-    async def test_skips_when_few_messages(self, tmp_path: Path) -> None:
-        """Consolidation should be a no-op when messages < keep_count."""
+    async def test_empty_session_is_noop(self, tmp_path: Path) -> None:
+        """Consolidation should be a no-op when session has no messages."""
         store = MemoryStore(tmp_path)
         provider = AsyncMock()
-        session = _make_session(message_count=10)
+        session = _make_session(message_count=0)
 
-        result = await store.consolidate(session, provider, "test-model", memory_window=50)
+        result = await store.consolidate(session, provider, "test-model", sender_id="user1")
 
         assert result is True
         provider.chat.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_per_user_isolation(self, tmp_path: Path) -> None:
+        """Different users should have separate memory files."""
+        store = MemoryStore(tmp_path)
+        provider = AsyncMock()
+
+        # Consolidate for user1
+        provider.chat = AsyncMock(
+            return_value=_make_tool_response(memory_update="User1 facts.")
+        )
+        session1 = _make_session(message_count=3)
+        await store.consolidate(session1, provider, "test-model", sender_id="user1")
+
+        # Consolidate for user2
+        provider.chat = AsyncMock(
+            return_value=_make_tool_response(memory_update="User2 facts.")
+        )
+        session2 = _make_session(message_count=3)
+        await store.consolidate(session2, provider, "test-model", sender_id="user2")
+
+        assert "User1 facts." in store.read_user_memory("user1")
+        assert "User2 facts." in store.read_user_memory("user2")
+        assert "User2" not in store.read_user_memory("user1")
+
+    @pytest.mark.asyncio
+    async def test_topic_passed_to_prompt(self, tmp_path: Path) -> None:
+        """When topic is provided, it should appear in the LLM prompt."""
+        store = MemoryStore(tmp_path)
+        provider = AsyncMock()
+        provider.chat = AsyncMock(
+            return_value=_make_tool_response(memory_update="API design notes.")
+        )
+        session = _make_session(message_count=5)
+
+        await store.consolidate(
+            session, provider, "test-model", sender_id="user1", topic="API design"
+        )
+
+        # Verify the topic was included in the prompt sent to the LLM
+        call_args = provider.chat.call_args
+        messages = call_args.kwargs.get("messages") or call_args[1].get("messages") or call_args[0][0]
+        user_msg = next(m for m in messages if m["role"] == "user")
+        assert "Focus the consolidation on: API design" in user_msg["content"]

@@ -35,6 +35,7 @@ Otherwise, answer directly."""
         skill_names: list[str] | None = None,
         include_skills: bool = True,
         include_escalation: bool = False,
+        sender_id: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity()]
@@ -43,7 +44,7 @@ Otherwise, answer directly."""
         if bootstrap:
             parts.append(bootstrap)
 
-        memory = self.memory.get_memory_context()
+        memory = self.memory.get_memory_context(sender_id)
         if memory:
             parts.append(f"# Memory\n\n{memory}")
 
@@ -83,8 +84,7 @@ You are nanobot, a helpful AI assistant.
 
 ## Workspace
 Your workspace is at: {workspace_path}
-- Long-term memory: {workspace_path}/memory/MEMORY.md (write important facts here)
-- History log: {workspace_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM].
+- Per-user memory is automatically managed and injected into context
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
 ## nanobot Guidelines
@@ -128,6 +128,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         chat_id: str | None = None,
         include_skills: bool = True,
         include_escalation: bool = False,
+        sender_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(channel, chat_id)
@@ -144,6 +145,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             {"role": "system", "content": self.build_system_prompt(
                 skill_names, include_skills=include_skills,
                 include_escalation=include_escalation,
+                sender_id=sender_id,
             )},
             *history,
             {"role": "user", "content": merged},

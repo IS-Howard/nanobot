@@ -438,6 +438,7 @@ class AgentLoop:
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
+                sender_id=msg.sender_id,
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages, use_tools=True)
             await self._save_turn_to_storage(key, session, all_msgs, 1 + len(history))
@@ -460,12 +461,14 @@ class AgentLoop:
                 await self.storage.clear_session(key)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
-        if cmd == "/consolidate":
+        if cmd == "/consolidate" or cmd.startswith("/consolidate "):
+            topic = msg.content.strip()[len("/consolidate"):].strip() or None
             try:
-                success = await self._consolidate_memory(session, archive_all=True)
+                success = await self._consolidate_memory(session, sender_id=msg.sender_id, topic=topic)
                 if success:
+                    result = f"Memory consolidated{f' (focus: {topic})' if topic else ''}."
                     return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                          content="Memory consolidated.")
+                                          content=result)
                 return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                       content="Consolidation failed. Please try again.")
             except Exception:
@@ -480,7 +483,7 @@ class AgentLoop:
                                   content=f"Tool mode {mode}{model_info}")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="nanobot commands:\n/new - Start a new conversation\n/consolidate - Save conversation to memory\n/tool - Toggle tool mode\n/stop - Stop the current task\n/help - Show available commands\n! prefix - One-shot tool mode")
+                                  content="nanobot commands:\n/new - Start a new conversation\n/consolidate [topic] - Save conversation to memory (optionally focused on a topic)\n/tool - Toggle tool mode\n/stop - Stop the current task\n/help - Show available commands\n! prefix - One-shot tool mode")
 
         # Determine tool usage
         use_tools, content = self._should_use_tools(key, msg.content)
@@ -510,6 +513,7 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id,
             include_skills=include_skills,
             include_escalation=include_escalation,
+            sender_id=msg.sender_id,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -541,6 +545,7 @@ class AgentLoop:
                         media=msg.media if msg.media else None,
                         channel=msg.channel, chat_id=msg.chat_id,
                         include_skills=True, include_escalation=False,
+                        sender_id=msg.sender_id,
                     )
                     final_content, _, all_msgs = await self._run_agent_loop(
                         initial_messages, on_progress=progress_cb,
@@ -611,11 +616,11 @@ class AgentLoop:
             session.messages.append(entry)
         session.updated_at = datetime.now()
 
-    async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
+    async def _consolidate_memory(self, session, sender_id: str, topic: str | None = None) -> bool:
         """Delegate to MemoryStore.consolidate(). Returns True on success."""
         return await MemoryStore(self.workspace).consolidate(
             session, self.provider, self.model,
-            archive_all=archive_all, memory_window=self.memory_window,
+            sender_id=sender_id, topic=topic,
         )
 
     async def process_direct(
