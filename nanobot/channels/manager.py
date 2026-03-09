@@ -7,7 +7,6 @@ from typing import Any
 
 from loguru import logger
 
-from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config
@@ -120,6 +119,15 @@ class ChannelManager:
                     self.bus.consume_outbound(),
                     timeout=1.0
                 )
+
+                if msg.metadata.get("_busy"):
+                    channel = self.channels.get(msg.channel)
+                    if channel:
+                        try:
+                            await channel.show_busy(msg.chat_id)
+                        except Exception:
+                            pass
+                    continue
 
                 if msg.metadata.get("_progress"):
                     if msg.metadata.get("_tool_hint") and not self.config.channels.send_tool_hints:

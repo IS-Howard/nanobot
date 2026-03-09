@@ -463,6 +463,10 @@ class LineChannel(BaseChannel):
             logger.error("LINE content download error: {}", e)
         return None
 
+    async def show_busy(self, chat_id: str) -> None:
+        """Show LINE loading animation when agent is busy."""
+        await self._show_loading(chat_id)
+
     async def _show_loading(self, chat_id: str) -> None:
         """Show loading animation in LINE chat."""
         if not self._http:

@@ -113,6 +113,10 @@ class BaseChannel(ABC):
 
         await self.bus.publish_inbound(msg)
 
+    async def show_busy(self, chat_id: str) -> None:
+        """Show a busy/typing indicator. Override in subclasses for channel-specific behavior."""
+        pass
+
     @property
     def is_running(self) -> bool:
         """Check if the channel is running."""

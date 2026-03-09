@@ -118,6 +118,7 @@ class AgentLoop:
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._processing_lock = asyncio.Lock()
+        self._busy_sessions: set[str] = set()
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -321,6 +322,9 @@ class AgentLoop:
             if msg.content.strip().lower() == "/stop":
                 await self._handle_stop(msg)
             else:
+                # Notify user if agent is busy processing
+                if msg.session_key in self._busy_sessions:
+                    await self._send_busy_notification(msg)
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(msg.session_key, []).append(task)
                 task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
@@ -342,9 +346,11 @@ class AgentLoop:
         ))
 
     async def _dispatch(self, msg: InboundMessage) -> None:
-        """Process a message under the global lock."""
+        """Process a message under the global lock, coalescing queued messages from the same user."""
         async with self._processing_lock:
+            self._busy_sessions.add(msg.session_key)
             try:
+                msg = self._coalesce(msg)
                 response = await self._process_message(msg)
                 if response is not None:
                     await self.bus.publish_outbound(response)
@@ -362,6 +368,67 @@ class AgentLoop:
                     channel=msg.channel, chat_id=msg.chat_id,
                     content="Sorry, I encountered an error.",
                 ))
+            finally:
+                self._busy_sessions.discard(msg.session_key)
+
+    def _coalesce(self, msg: InboundMessage) -> InboundMessage:
+        """Drain the inbound queue and coalesce messages from the same user.
+
+        Slash commands and messages from other users/sessions are re-queued.
+        """
+        extra: list[InboundMessage] = []
+        requeue: list[InboundMessage] = []
+
+        while not self.bus.inbound.empty():
+            try:
+                queued = self.bus.inbound.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            if queued.content.strip().startswith("/"):
+                requeue.append(queued)
+            elif (queued.session_key == msg.session_key
+                    and queued.sender_id == msg.sender_id):
+                extra.append(queued)
+            else:
+                requeue.append(queued)
+
+        for m in requeue:
+            self.bus.inbound.put_nowait(m)
+
+        if not extra:
+            return msg
+
+        all_msgs = [msg] + extra
+        combined_content = "\n".join(m.content for m in all_msgs if m.content)
+        combined_media: list[str] = []
+        for m in all_msgs:
+            combined_media.extend(m.media)
+        combined_metadata: dict = {}
+        for m in all_msgs:
+            combined_metadata.update(m.metadata)
+
+        logger.info("Coalesced {} messages from {}:{}", len(all_msgs), msg.session_key, msg.sender_id)
+
+        return InboundMessage(
+            channel=msg.channel,
+            sender_id=msg.sender_id,
+            chat_id=msg.chat_id,
+            content=combined_content,
+            timestamp=all_msgs[-1].timestamp,
+            media=combined_media,
+            metadata=combined_metadata,
+            session_key_override=msg.session_key_override,
+        )
+
+    async def _send_busy_notification(self, msg: InboundMessage) -> None:
+        """Notify the channel that the agent is busy processing."""
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content="",
+            metadata={"_busy": True},
+        ))
 
     async def close_mcp(self) -> None:
         """Close MCP connections."""
