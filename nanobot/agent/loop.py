@@ -71,9 +71,11 @@ class AgentLoop:
         storage: PostgresStorage | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        parallel: bool = False,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.bus = bus
+        self.parallel = parallel
         self.channels_config = channels_config
         self.provider = provider
         self.workspace = workspace
@@ -117,7 +119,8 @@ class AgentLoop:
         self._mcp_connected = False
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
-        self._processing_lock = asyncio.Lock()
+        self._global_lock = asyncio.Lock()
+        self._session_locks: dict[str, asyncio.Lock] = {}
         self._busy_sessions: set[str] = set()
         self._register_default_tools()
 
@@ -323,7 +326,9 @@ class AgentLoop:
                 await self._handle_stop(msg)
             else:
                 # Notify user if agent is busy processing
-                if msg.session_key in self._busy_sessions:
+                is_busy = (msg.session_key in self._busy_sessions
+                           if self.parallel else bool(self._busy_sessions))
+                if is_busy:
                     await self._send_busy_notification(msg)
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(msg.session_key, []).append(task)
@@ -345,9 +350,15 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id, content=content,
         ))
 
+    def _get_lock(self, session_key: str) -> asyncio.Lock:
+        """Return the appropriate lock based on parallel mode."""
+        if self.parallel:
+            return self._session_locks.setdefault(session_key, asyncio.Lock())
+        return self._global_lock
+
     async def _dispatch(self, msg: InboundMessage) -> None:
-        """Process a message under the global lock, coalescing queued messages from the same user."""
-        async with self._processing_lock:
+        """Process a message under lock, coalescing queued messages from the same user."""
+        async with self._get_lock(msg.session_key):
             self._busy_sessions.add(msg.session_key)
             try:
                 msg = self._coalesce(msg)

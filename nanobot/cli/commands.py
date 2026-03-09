@@ -317,6 +317,7 @@ def gateway(
         storage=storage,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        parallel=config.agents.defaults.parallel,
     )
 
     # Set cron callback (needs agent)
@@ -506,6 +507,7 @@ def agent(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        parallel=config.agents.defaults.parallel,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on

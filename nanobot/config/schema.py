@@ -45,6 +45,7 @@ class AgentDefaults(Base):
     max_tool_iterations: int = 40
     max_context_items: int = 20  # max history messages sent to LLM
     reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
+    parallel: bool = False  # True: per-session parallel processing; False: single global lock
 
 
 class AgentsConfig(Base):
