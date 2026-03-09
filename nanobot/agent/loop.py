@@ -364,6 +364,9 @@ class AgentLoop:
         async with self._get_lock(msg.session_key):
             try:
                 msg = self._coalesce(msg)
+                # Show busy indicator when processing starts (skip CLI and slash commands)
+                if msg.channel != "cli" and not msg.content.strip().startswith("/"):
+                    await self._send_busy_notification(msg)
                 response = await self._process_message(msg)
                 if response is not None:
                     await self.bus.publish_outbound(response)

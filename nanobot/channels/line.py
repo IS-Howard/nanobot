@@ -473,13 +473,15 @@ class LineChannel(BaseChannel):
         if not self._http:
             return
         try:
-            await self._http.post(
+            resp = await self._http.post(
                 f"{LINE_API_BASE}/chat/loading",
                 headers=self._auth_headers,
                 json={"chatId": chat_id, "loadingSeconds": 30},
             )
-        except Exception:
-            pass  # Best-effort, don't log failures
+            if resp.status_code != 202:
+                logger.warning("LINE loading API returned {}: {}", resp.status_code, resp.text[:200])
+        except Exception as e:
+            logger.warning("LINE loading API error: {}", e)
 
     async def _push_messages(self, to: str, messages: list[dict[str, Any]]) -> None:
         """Push messages to a user/group via LINE Messaging API."""

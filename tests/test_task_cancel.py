@@ -100,6 +100,10 @@ class TestDispatch:
             return_value=OutboundMessage(channel="test", chat_id="c1", content="hi")
         )
         await loop._dispatch(msg)
+        # First outbound is the busy notification
+        busy = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        assert busy.metadata.get("_busy") is True
+        # Second outbound is the actual response
         out = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
         assert out.content == "hi"
 
