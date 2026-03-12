@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
-from nanobot.agent.memory import MemoryStore
+from nanobot.agent.memory import MemoryStore, extract_memorize_tags
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
@@ -558,6 +558,18 @@ class AgentLoop:
                 logger.exception("Consolidation failed for {}", session.key)
                 return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                       content="Consolidation failed. Please try again.")
+        if cmd == "/cleanup":
+            try:
+                success = await self._cleanup_memory(sender_id=msg.sender_id)
+                if success:
+                    return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                          content="Memory cleaned up.")
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="Cleanup failed. Please try again.")
+            except Exception:
+                logger.exception("Cleanup failed for {}", session.key)
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="Cleanup failed. Please try again.")
         if cmd == "/tool":
             self._tool_mode[key] = not self._tool_mode.get(key, False)
             mode = "ON" if self._tool_mode[key] else "OFF"
@@ -566,7 +578,7 @@ class AgentLoop:
                                   content=f"Tool mode {mode}{model_info}")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="nanobot commands:\n/new - Start a new conversation\n/consolidate [topic] - Save conversation to memory (optionally focused on a topic)\n/tool - Toggle tool mode\n/stop - Stop the current task\n/help - Show available commands\n! prefix - One-shot tool mode")
+                                  content="nanobot commands:\n/new - Start a new conversation\n/consolidate [topic] - Save conversation to memory (optionally focused on a topic)\n/cleanup - Compact and deduplicate memory files\n/tool - Toggle tool mode\n/stop - Stop the current task\n/help - Show available commands\n! prefix - One-shot tool mode")
 
         # Determine tool usage
         use_tools, content = self._should_use_tools(key, msg.content)
@@ -643,6 +655,17 @@ class AgentLoop:
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
+        # Extract and persist any memorize tags the LLM emitted
+        final_content, global_facts, user_facts = extract_memorize_tags(final_content)
+        if global_facts or user_facts:
+            store = MemoryStore(self.workspace)
+            for fact in global_facts:
+                store.append_global_memory(fact)
+                logger.info("Global memory appended: {}", fact[:80])
+            for fact in user_facts:
+                store.append_user_memory(msg.sender_id, fact)
+                logger.info("User memory appended for {}: {}", msg.sender_id, fact[:80])
+
         await self._save_turn_to_storage(key, session, all_msgs, 1 + len(history))
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
@@ -701,9 +724,20 @@ class AgentLoop:
 
     async def _consolidate_memory(self, session, sender_id: str, topic: str | None = None) -> bool:
         """Delegate to MemoryStore.consolidate(). Returns True on success."""
+        system_prompt = self.context.build_system_prompt(include_memory=False, sender_id=sender_id)
         return await MemoryStore(self.workspace).consolidate(
             session, self.provider, self.model,
             sender_id=sender_id, topic=topic,
+            system_prompt=system_prompt,
+        )
+
+    async def _cleanup_memory(self, sender_id: str) -> bool:
+        """Compact and deduplicate memory files. Returns True on success."""
+        system_prompt = self.context.build_system_prompt(include_memory=False, sender_id=sender_id)
+        return await MemoryStore(self.workspace).cleanup(
+            self.provider, self.model,
+            sender_id=sender_id,
+            system_prompt=system_prompt,
         )
 
     async def process_direct(

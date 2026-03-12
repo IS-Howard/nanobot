@@ -30,11 +30,26 @@ switching to a more capable model. If the user's request would benefit from usin
 respond ONLY with: <need_tools>brief reason why tools are needed</need_tools>
 Otherwise, answer directly."""
 
+    _MEMORIZE_INSTRUCTIONS = """\
+## Memory Management
+
+You can silently save important information to long-term memory using XML tags in your response.
+These tags are stripped before the user sees your message.
+
+- `<memorize_global>fact</memorize_global>` — Save to global memory (shared across all users). Use for project info, general facts, shared context.
+- `<memorize_user>fact</memorize_user>` — Save to this user's private memory. Use for user preferences, personal details, user-specific context.
+
+Guidelines:
+- Only memorize genuinely new, useful information not already present in existing memory above.
+- Do NOT memorize your own tools, skills, or capabilities — these are already in the system prompt.
+- Keep each memorized fact concise — one clear statement per tag."""
+
     def build_system_prompt(
         self,
         skill_names: list[str] | None = None,
         include_skills: bool = True,
         include_escalation: bool = False,
+        include_memory: bool = True,
         sender_id: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
@@ -44,9 +59,12 @@ Otherwise, answer directly."""
         if bootstrap:
             parts.append(bootstrap)
 
-        memory = self.memory.get_memory_context(sender_id)
-        if memory:
-            parts.append(f"# Memory\n\n{memory}")
+        if include_memory:
+            memory = self.memory.get_memory_context(sender_id)
+            if memory:
+                parts.append(f"# Memory\n\n{memory}")
+
+        parts.append(self._MEMORIZE_INSTRUCTIONS)
 
         if include_skills:
             always_skills = self.skills.get_always_skills()

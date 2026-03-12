@@ -63,6 +63,10 @@ def _quick_reply() -> dict:
             "data": "action=consolidate", "displayText": "/consolidate",
         }},
         {"type": "action", "action": {
+            "type": "postback", "label": "Cleanup",
+            "data": "action=cleanup", "displayText": "/cleanup",
+        }},
+        {"type": "action", "action": {
             "type": "postback", "label": "New Chat",
             "data": "action=new", "displayText": "/new",
         }},
@@ -353,7 +357,7 @@ class LineChannel(BaseChannel):
     async def _process_postback(self, event: dict[str, Any]) -> None:
         """Process a postback event (from Quick Reply buttons)."""
         data = event.get("postback", {}).get("data", "")
-        action_map = {"tool": "/tool", "consolidate": "/consolidate", "new": "/new"}
+        action_map = {"tool": "/tool", "consolidate": "/consolidate", "cleanup": "/cleanup", "new": "/new"}
         params = dict(p.split("=", 1) for p in data.split("&") if "=" in p)
         command = action_map.get(params.get("action", ""))
         if not command:
