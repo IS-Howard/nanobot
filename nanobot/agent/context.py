@@ -33,16 +33,20 @@ Otherwise, answer directly."""
     _MEMORIZE_INSTRUCTIONS = """\
 ## Memory Management
 
-You can silently save important information to long-term memory using XML tags in your response.
+You can silently save important information to long-term memory using XML tags anywhere in your response.
 These tags are stripped before the user sees your message.
 
-- `<memorize_global>fact</memorize_global>` — Save to global memory (shared across all users). Use for project info, general facts, shared context.
-- `<memorize_user>fact</memorize_user>` — Save to this user's private memory. Use for user preferences, personal details, user-specific context.
+- `<memorize_global>fact</memorize_global>` — Global memory (all users). Use for: project info, shared facts, general context.
+- `<memorize_user>fact</memorize_user>` — This user's private memory. Use for: language/tone preferences, personal details, user-specific context.
 
-Guidelines:
-- Only memorize genuinely new, useful information not already present in existing memory above.
-- Do NOT memorize your own tools, skills, or capabilities — these are already in the system prompt.
-- Keep each memorized fact concise — one clear statement per tag."""
+**Memorize immediately** when the user states a preference or correction (language, style, name, topic, etc.) — do not wait to be asked.
+
+Do NOT memorize:
+- Current time, date, channel, or chat ID (already injected every turn)
+- Your own tools, skills, or capabilities (already in system prompt)
+- Anything already present in the existing memory shown above
+
+Keep each fact concise — one clear statement per tag."""
 
     def build_system_prompt(
         self,
