@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
+from nanobot.agent.access import AccessManager
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryStore, extract_memorize_tags
 from nanobot.agent.subagent import SubagentManager
@@ -72,8 +73,10 @@ class AgentLoop:
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
         parallel: bool = False,
+        access: AccessManager | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
+        self.access = access
         self.bus = bus
         self.parallel = parallel
         self.channels_config = channels_config
@@ -223,6 +226,7 @@ class AgentLoop:
         on_progress: Callable[..., Awaitable[None]] | None = None,
         use_tools: bool = True,
         model: str | None = None,
+        allowed_tools: list[str] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
         messages = initial_messages
@@ -232,7 +236,7 @@ class AgentLoop:
         active_model = model or self.model
         # Use tool_provider when switching to tool_model (may need different provider type)
         active_provider = (self.tool_provider or self.provider) if (model and model == self.tool_model and self.tool_provider) else self.provider
-        tool_defs = self.tools.get_definitions() if use_tools else None
+        tool_defs = self.tools.get_definitions(allowed=allowed_tools) if use_tools else None
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -282,7 +286,11 @@ class AgentLoop:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    # Guard: reject tool calls not in the allowed list
+                    if allowed_tools is not None and tool_call.name not in allowed_tools:
+                        result = f"Error: Tool '{tool_call.name}' is not permitted for this user."
+                    else:
+                        result = await self.tools.execute(tool_call.name, tool_call.arguments)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -492,8 +500,13 @@ class AgentLoop:
             if new_msgs:
                 await self.storage.save_messages(key, new_msgs)
 
-    def _should_use_tools(self, key: str, content: str) -> tuple[bool, str]:
+    def _should_use_tools(self, key: str, content: str, sender_id: str | None = None) -> tuple[bool, str]:
         """Determine if tools should be used. Returns (use_tools, cleaned_content)."""
+        # Non-admins cannot manually activate tool mode (strip ! prefix so LLM sees clean text)
+        if sender_id and self.access and not self.access.is_admin(sender_id):
+            if content.startswith("!") and len(content) > 1:
+                content = content[1:].strip()
+            return False, content
         # Persistent tool mode
         if self._tool_mode.get(key, False):
             return True, content
@@ -571,17 +584,42 @@ class AgentLoop:
                 return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                       content="Cleanup failed. Please try again.")
         if cmd == "/tool":
+            # Non-admins cannot toggle tool mode
+            if self.access and not self.access.is_admin(msg.sender_id):
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="Access denied. Only admins can toggle tool mode.")
             self._tool_mode[key] = not self._tool_mode.get(key, False)
             mode = "ON" if self._tool_mode[key] else "OFF"
             model_info = f" (model: {self.tool_model or self.model})" if self._tool_mode[key] else ""
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content=f"Tool mode {mode}{model_info}")
+
+        # /admin commands
+        if cmd.startswith("/admin") and self.access:
+            return self._handle_admin_command(msg)
+
         if cmd == "/help":
+            help_text = (
+                "nanobot commands:\n"
+                "/new - Start a new conversation\n"
+                "/consolidate [topic] - Save conversation to memory (optionally focused on a topic)\n"
+                "/cleanup - Compact and deduplicate memory files\n"
+                "/tool - Toggle tool mode\n"
+                "/stop - Stop the current task\n"
+                "/admin <passphrase> - Authenticate as admin\n"
+                "/admin panel - Show permissions panel\n"
+                "/help - Show available commands\n"
+                "! prefix - One-shot tool mode"
+            )
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="nanobot commands:\n/new - Start a new conversation\n/consolidate [topic] - Save conversation to memory (optionally focused on a topic)\n/cleanup - Compact and deduplicate memory files\n/tool - Toggle tool mode\n/stop - Stop the current task\n/help - Show available commands\n! prefix - One-shot tool mode")
+                                  content=help_text)
 
         # Determine tool usage
-        use_tools, content = self._should_use_tools(key, msg.content)
+        use_tools, content = self._should_use_tools(key, msg.content, sender_id=msg.sender_id)
+
+        # Resolve access-control filtered tool/skill lists
+        allowed_tools = self.access.get_allowed_tools(msg.sender_id) if self.access else None
+        allowed_skills = self.access.get_allowed_skills(msg.sender_id) if self.access else None
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
@@ -609,6 +647,7 @@ class AgentLoop:
             include_skills=include_skills,
             include_escalation=include_escalation,
             sender_id=msg.sender_id,
+            allowed_skills=allowed_skills,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -633,7 +672,7 @@ class AgentLoop:
                 if match:
                     reason = match.group(1).strip()
                     logger.info("Auto-escalating to tool model: {}", reason)
-                    # Pass 2: tool model with FC + skills
+                    # Pass 2: tool model with FC + skills (filtered for normal users)
                     initial_messages = self.context.build_messages(
                         history=history,
                         current_message=content,
@@ -641,15 +680,18 @@ class AgentLoop:
                         channel=msg.channel, chat_id=msg.chat_id,
                         include_skills=True, include_escalation=False,
                         sender_id=msg.sender_id,
+                        allowed_skills=allowed_skills,
                     )
                     final_content, _, all_msgs = await self._run_agent_loop(
                         initial_messages, on_progress=progress_cb,
                         use_tools=True, model=self.tool_model,
+                        allowed_tools=allowed_tools,
                     )
         else:
             final_content, _, all_msgs = await self._run_agent_loop(
                 initial_messages, on_progress=progress_cb,
                 use_tools=use_tools, model=active_model,
+                allowed_tools=allowed_tools if use_tools else None,
             )
 
         if final_content is None:
@@ -677,6 +719,88 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
             metadata=msg.metadata or {},
         )
+
+    def _handle_admin_command(self, msg: InboundMessage) -> OutboundMessage:
+        """Handle /admin slash commands."""
+        assert self.access is not None
+        raw = msg.content.strip()
+        parts = raw.split(None, 2)  # ["/admin", subcommand?, arg?]
+        sub = parts[1] if len(parts) > 1 else ""
+        arg = parts[2] if len(parts) > 2 else ""
+
+        # /admin <passphrase> — anyone can attempt authentication
+        if sub and sub not in ("panel", "toggle_tool", "toggle_skill", "passphrase", "revoke"):
+            ok = self.access.authenticate(msg.sender_id, sub)
+            status = "Authenticated as admin." if ok else "Invalid passphrase."
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content=status,
+                                  metadata={"_admin_auth": ok, **(msg.metadata or {})})
+
+        # Everything below requires admin
+        if not self.access.is_admin(msg.sender_id):
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content="Access denied. Authenticate first with /admin <passphrase>")
+
+        if sub == "panel":
+            all_tools = self.tools.tool_names
+            all_skills = [s["name"] for s in self.context.skills.list_skills()]
+            allowed_tools = self.access.get_allowed_tools("__normal__") or []
+            allowed_skills = self.access.get_allowed_skills("__normal__") or []
+            lines = ["**Admin Panel — Normal User Permissions**\n"]
+            lines.append("**Tools:**")
+            for t in all_tools:
+                icon = "ON" if t in allowed_tools else "OFF"
+                lines.append(f"  {icon} `{t}`")
+            lines.append("\n**Skills:**")
+            for s in all_skills:
+                icon = "ON" if s in allowed_skills else "OFF"
+                lines.append(f"  {icon} `{s}`")
+            lines.append(f"\nUse `/admin toggle_tool <name>` or `/admin toggle_skill <name>` to change.")
+            content = "\n".join(lines)
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content=content,
+                                  metadata={"_admin_panel": True,
+                                            "tools": all_tools,
+                                            "skills": all_skills,
+                                            "allowed_tools": allowed_tools,
+                                            "allowed_skills": allowed_skills,
+                                            **(msg.metadata or {})})
+
+        if sub == "toggle_tool":
+            if not arg:
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="Usage: /admin toggle_tool <name>")
+            new_state = self.access.toggle_tool(arg)
+            status = "ON" if new_state else "OFF"
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content=f"Tool `{arg}` for normal users: {status}")
+
+        if sub == "toggle_skill":
+            if not arg:
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="Usage: /admin toggle_skill <name>")
+            new_state = self.access.toggle_skill(arg)
+            status = "ON" if new_state else "OFF"
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content=f"Skill `{arg}` for normal users: {status}")
+
+        if sub == "passphrase":
+            if not arg:
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="Usage: /admin passphrase <new>")
+            self.access.set_passphrase(arg)
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content="Admin passphrase updated.")
+
+        if sub == "revoke":
+            target = arg or msg.sender_id
+            ok = self.access.revoke_admin(target)
+            status = f"Admin access revoked for `{target}`." if ok else f"`{target}` is not an admin."
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content=status)
+
+        return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                              content="Unknown /admin subcommand. Try: panel, toggle_tool, toggle_skill, passphrase, revoke")
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
         """Save user messages and final assistant reply into session.

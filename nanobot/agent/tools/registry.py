@@ -31,9 +31,17 @@ class ToolRegistry:
         """Check if a tool is registered."""
         return name in self._tools
 
-    def get_definitions(self) -> list[dict[str, Any]]:
-        """Get all tool definitions in OpenAI format."""
-        return [tool.to_schema() for tool in self._tools.values()]
+    def get_definitions(self, allowed: list[str] | None = None) -> list[dict[str, Any]]:
+        """Get tool definitions in OpenAI format.
+
+        Args:
+            allowed: If *None*, return all tools (admin). If a list, return only
+                     tools whose name is in the list.
+        """
+        tools = self._tools.values() if allowed is None else [
+            t for t in self._tools.values() if t.name in allowed
+        ]
+        return [tool.to_schema() for tool in tools]
 
     async def execute(self, name: str, params: dict[str, Any]) -> str:
         """Execute a tool by name with given parameters."""

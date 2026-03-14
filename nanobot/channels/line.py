@@ -51,26 +51,6 @@ _EXT_TYPES: dict[str, tuple[str, str]] = {
 }
 
 
-def _quick_reply() -> dict:
-    """Quick Reply buttons for common actions."""
-    return {"items": [
-        {"type": "action", "action": {
-            "type": "postback", "label": "Tool Mode",
-            "data": "action=tool", "displayText": "/tool",
-        }},
-        {"type": "action", "action": {
-            "type": "postback", "label": "Consolidate",
-            "data": "action=consolidate", "displayText": "/consolidate",
-        }},
-        {"type": "action", "action": {
-            "type": "postback", "label": "Cleanup",
-            "data": "action=cleanup", "displayText": "/cleanup",
-        }},
-        {"type": "action", "action": {
-            "type": "postback", "label": "New Chat",
-            "data": "action=new", "displayText": "/new",
-        }},
-    ]}
 
 
 def _flex_tool_status(content: str) -> dict | None:
@@ -128,6 +108,216 @@ def _flex_help(content: str) -> dict | None:
     }
 
 
+def _flex_admin_panel(
+    tools: list[str],
+    skills: list[str],
+    allowed_tools: list[str],
+    allowed_skills: list[str],
+) -> dict:
+    """Build Flex carousel for the admin permissions panel."""
+    def _toggle_bubble(title: str, items: list[str], enabled: list[str], action_prefix: str) -> dict:
+        rows: list[dict] = []
+        for name in items:
+            is_on = name in enabled
+            color = "#06C755" if is_on else "#CCCCCC"
+            label = f"{'ON' if is_on else 'OFF'} {name}"
+            rows.append({
+                "type": "box", "layout": "horizontal", "spacing": "sm",
+                "margin": "sm",
+                "action": {
+                    "type": "postback",
+                    "label": name[:20],
+                    "data": f"action={action_prefix}&name={name}",
+                    "displayText": f"/admin {action_prefix} {name}",
+                },
+                "contents": [
+                    {"type": "text", "text": "●" if is_on else "○", "size": "sm",
+                     "color": color, "flex": 0, "gravity": "center"},
+                    {"type": "text", "text": name, "size": "sm", "color": "#333333", "wrap": True},
+                ],
+            })
+        if not rows:
+            rows.append({"type": "text", "text": "(none)", "size": "sm", "color": "#999999"})
+        return {
+            "type": "bubble", "size": "kilo",
+            "body": {"type": "box", "layout": "vertical", "contents": [
+                {"type": "text", "text": title, "weight": "bold", "size": "md"},
+                {"type": "separator", "margin": "md"},
+                {"type": "box", "layout": "vertical", "margin": "md", "contents": rows},
+            ]},
+        }
+
+    bubbles = []
+    # Split tools into groups of 8 per bubble
+    for i in range(0, max(len(tools), 1), 8):
+        chunk = tools[i:i + 8]
+        label = "Tools" if i == 0 else f"Tools ({i + 1}+)"
+        bubbles.append(_toggle_bubble(label, chunk, allowed_tools, "toggle_tool"))
+    for i in range(0, max(len(skills), 1), 8):
+        chunk = skills[i:i + 8]
+        label = "Skills" if i == 0 else f"Skills ({i + 1}+)"
+        bubbles.append(_toggle_bubble(label, chunk, allowed_skills, "toggle_skill"))
+
+    return {
+        "type": "flex", "altText": "Admin Panel",
+        "contents": {"type": "carousel", "contents": bubbles},
+    }
+
+
+# ── Bitmap font & PNG renderer for Rich Menu images ────────────────
+# 5x7 uppercase bitmap font — each char is 5 columns of 7-bit rows.
+_FONT: dict[str, list[int]] = {
+    "A": [0x7E, 0x09, 0x09, 0x09, 0x7E],
+    "B": [0x7F, 0x49, 0x49, 0x49, 0x36],
+    "C": [0x3E, 0x41, 0x41, 0x41, 0x22],
+    "D": [0x7F, 0x41, 0x41, 0x41, 0x3E],
+    "E": [0x7F, 0x49, 0x49, 0x49, 0x41],
+    "F": [0x7F, 0x09, 0x09, 0x09, 0x01],
+    "G": [0x3E, 0x41, 0x49, 0x49, 0x3A],
+    "H": [0x7F, 0x08, 0x08, 0x08, 0x7F],
+    "I": [0x41, 0x7F, 0x41, 0x00, 0x00],
+    "J": [0x20, 0x40, 0x40, 0x3F, 0x00],
+    "K": [0x7F, 0x08, 0x14, 0x22, 0x41],
+    "L": [0x7F, 0x40, 0x40, 0x40, 0x40],
+    "M": [0x7F, 0x02, 0x04, 0x02, 0x7F],
+    "N": [0x7F, 0x02, 0x0C, 0x10, 0x7F],
+    "O": [0x3E, 0x41, 0x41, 0x41, 0x3E],
+    "P": [0x7F, 0x09, 0x09, 0x09, 0x06],
+    "Q": [0x3E, 0x41, 0x51, 0x21, 0x5E],
+    "R": [0x7F, 0x09, 0x19, 0x29, 0x46],
+    "S": [0x26, 0x49, 0x49, 0x49, 0x32],
+    "T": [0x01, 0x01, 0x7F, 0x01, 0x01],
+    "U": [0x3F, 0x40, 0x40, 0x40, 0x3F],
+    "V": [0x0F, 0x30, 0x40, 0x30, 0x0F],
+    "W": [0x7F, 0x20, 0x10, 0x20, 0x7F],
+    "X": [0x63, 0x14, 0x08, 0x14, 0x63],
+    "Y": [0x03, 0x04, 0x78, 0x04, 0x03],
+    "Z": [0x61, 0x51, 0x49, 0x45, 0x43],
+    "a": [0x20, 0x54, 0x54, 0x54, 0x78],
+    "b": [0x7F, 0x44, 0x44, 0x44, 0x38],
+    "c": [0x38, 0x44, 0x44, 0x44, 0x28],
+    "d": [0x38, 0x44, 0x44, 0x44, 0x7F],
+    "e": [0x38, 0x54, 0x54, 0x54, 0x18],
+    "f": [0x08, 0x7E, 0x09, 0x01, 0x02],
+    "g": [0x08, 0x54, 0x54, 0x54, 0x3C],
+    "h": [0x7F, 0x08, 0x04, 0x04, 0x78],
+    "i": [0x00, 0x44, 0x7D, 0x40, 0x00],
+    "j": [0x20, 0x40, 0x44, 0x3D, 0x00],
+    "k": [0x7F, 0x10, 0x28, 0x44, 0x00],
+    "l": [0x00, 0x41, 0x7F, 0x40, 0x00],
+    "m": [0x7C, 0x04, 0x18, 0x04, 0x78],
+    "n": [0x7C, 0x08, 0x04, 0x04, 0x78],
+    "o": [0x38, 0x44, 0x44, 0x44, 0x38],
+    "p": [0x7C, 0x14, 0x14, 0x14, 0x08],
+    "q": [0x08, 0x14, 0x14, 0x14, 0x7C],
+    "r": [0x7C, 0x08, 0x04, 0x04, 0x08],
+    "s": [0x48, 0x54, 0x54, 0x54, 0x24],
+    "t": [0x04, 0x3F, 0x44, 0x40, 0x20],
+    "u": [0x3C, 0x40, 0x40, 0x20, 0x7C],
+    "v": [0x1C, 0x20, 0x40, 0x20, 0x1C],
+    "w": [0x3C, 0x40, 0x30, 0x40, 0x3C],
+    "x": [0x44, 0x28, 0x10, 0x28, 0x44],
+    "y": [0x0C, 0x50, 0x50, 0x50, 0x3C],
+    "z": [0x44, 0x64, 0x54, 0x4C, 0x44],
+    " ": [0x00, 0x00, 0x00, 0x00, 0x00],
+    "0": [0x3E, 0x51, 0x49, 0x45, 0x3E],
+    "1": [0x00, 0x42, 0x7F, 0x40, 0x00],
+    "2": [0x42, 0x61, 0x51, 0x49, 0x46],
+    "3": [0x22, 0x41, 0x49, 0x49, 0x36],
+    "4": [0x18, 0x14, 0x12, 0x7F, 0x10],
+    "5": [0x27, 0x45, 0x45, 0x45, 0x39],
+    "6": [0x3E, 0x49, 0x49, 0x49, 0x32],
+    "7": [0x01, 0x71, 0x09, 0x05, 0x03],
+    "8": [0x36, 0x49, 0x49, 0x49, 0x36],
+    "9": [0x26, 0x49, 0x49, 0x49, 0x3E],
+}
+
+
+def _render_rich_menu_png(
+    width: int, height: int,
+    rows: list[list[tuple[str, tuple[int, int, int]]]],
+) -> bytes:
+    """Render a Rich Menu PNG with labeled colored cells arranged in rows.
+
+    Args:
+        width: Image width in pixels.
+        height: Image height in pixels.
+        rows: List of rows, each row is a list of (label, (r, g, b)) cells.
+              Cells in each row are evenly divided across the width.
+    """
+    import struct
+    import zlib
+
+    scale = 8   # each font pixel = 8x8 real pixels
+    gap = 4     # px separator between cells
+
+    pixels = bytearray(width * height * 3)
+    num_rows = len(rows)
+    row_height = height // num_rows
+
+    for ri, row in enumerate(rows):
+        y0 = ri * row_height
+        y1 = y0 + row_height if ri < num_rows - 1 else height
+        cell_width = width // len(row)
+
+        for ci, (label, (r, g, b)) in enumerate(row):
+            x0 = ci * cell_width
+            x1 = x0 + cell_width if ci < len(row) - 1 else width
+
+            # Fill cell background with separators
+            for y in range(y0, y1):
+                for x in range(x0, x1):
+                    is_sep = ((x < x0 + gap // 2 and ci > 0)
+                              or (y < y0 + gap // 2 and ri > 0))
+                    if is_sep:
+                        pixels[(y * width + x) * 3:(y * width + x) * 3 + 3] = b"\xff\xff\xff"
+                    else:
+                        pixels[(y * width + x) * 3:(y * width + x) * 3 + 3] = bytes((r, g, b))
+
+            # Render label centered in cell
+            char_w = 5 * scale + scale
+            text_w = len(label) * char_w - scale
+            text_h = 7 * scale
+            tx = x0 + (x1 - x0 - text_w) // 2
+            ty = y0 + (y1 - y0 - text_h) // 2
+
+            for chi, ch in enumerate(label):
+                glyph = _FONT.get(ch)
+                if not glyph:
+                    continue
+                cx = tx + chi * char_w
+                for col in range(5):
+                    bits = glyph[col]
+                    for row_bit in range(7):
+                        if bits & (1 << row_bit):
+                            for dy in range(scale):
+                                for dx in range(scale):
+                                    px = cx + col * scale + dx
+                                    py = ty + row_bit * scale + dy
+                                    if 0 <= px < width and 0 <= py < height:
+                                        off = (py * width + px) * 3
+                                        pixels[off:off + 3] = b"\xff\xff\xff"
+
+    # Encode as PNG
+    raw_rows = bytearray()
+    for y in range(height):
+        raw_rows.append(0)  # filter byte
+        raw_rows.extend(pixels[y * width * 3:(y + 1) * width * 3])
+
+    compressed = zlib.compress(bytes(raw_rows), 6)
+
+    def _chunk(chunk_type: bytes, data: bytes) -> bytes:
+        c = chunk_type + data
+        crc = zlib.crc32(c) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + c + struct.pack(">I", crc)
+
+    png = b"\x89PNG\r\n\x1a\n"
+    png += _chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    png += _chunk(b"IDAT", compressed)
+    png += _chunk(b"IEND", b"")
+    return png
+
+
 class LineChannel(BaseChannel):
     """LINE channel using Messaging API with webhook receiver."""
 
@@ -146,6 +336,8 @@ class LineChannel(BaseChannel):
         self._http: httpx.AsyncClient | None = None
         self._storage = storage
         self._max_files = max_files_per_session
+        self._rich_menu_admin: str | None = None
+        self._rich_menu_normal: str | None = None
 
     async def start(self) -> None:
         """Start webhook server and listen for LINE events."""
@@ -186,6 +378,9 @@ class LineChannel(BaseChannel):
             self.config.webhook_path,
         )
 
+        # Set up Rich Menus for admin / normal users
+        await self._setup_rich_menus()
+
         # Keep running
         while self._running:
             await asyncio.sleep(1)
@@ -212,7 +407,19 @@ class LineChannel(BaseChannel):
         # Check if content should be upgraded to Flex Message
         flex_msg = None
         if msg.content and not is_progress:
-            flex_msg = _flex_tool_status(msg.content) or _flex_help(msg.content)
+            if msg.metadata.get("_admin_panel"):
+                flex_msg = _flex_admin_panel(
+                    msg.metadata.get("tools", []),
+                    msg.metadata.get("skills", []),
+                    msg.metadata.get("allowed_tools", []),
+                    msg.metadata.get("allowed_skills", []),
+                )
+            else:
+                flex_msg = _flex_tool_status(msg.content) or _flex_help(msg.content)
+
+        # Switch Rich Menu when user authenticates as admin
+        if msg.metadata.get("_admin_auth") and self._rich_menu_admin:
+            asyncio.create_task(self._link_rich_menu(msg.chat_id, self._rich_menu_admin))
 
         if flex_msg:
             messages.append(flex_msg)
@@ -230,10 +437,6 @@ class LineChannel(BaseChannel):
 
         if not messages:
             return
-
-        # Attach Quick Reply buttons to the last message (non-progress only)
-        if not is_progress and messages:
-            messages[-1]["quickReply"] = _quick_reply()
 
         # LINE allows max 5 messages per push call
         for i in range(0, len(messages), LINE_MAX_MESSAGES_PER_PUSH):
@@ -355,11 +558,23 @@ class LineChannel(BaseChannel):
         )
 
     async def _process_postback(self, event: dict[str, Any]) -> None:
-        """Process a postback event (from Quick Reply buttons)."""
+        """Process a postback event (from Quick Reply and admin panel buttons)."""
         data = event.get("postback", {}).get("data", "")
-        action_map = {"tool": "/tool", "consolidate": "/consolidate", "cleanup": "/cleanup", "new": "/new"}
+        action_map = {
+            "tool": "/tool",
+            "consolidate": "/consolidate",
+            "cleanup": "/cleanup",
+            "new": "/new",
+            "admin_panel": "/admin panel",
+        }
         params = dict(p.split("=", 1) for p in data.split("&") if "=" in p)
-        command = action_map.get(params.get("action", ""))
+        action = params.get("action", "")
+        # Dynamic admin toggle commands
+        if action in ("toggle_tool", "toggle_skill"):
+            name = params.get("name", "")
+            command = f"/admin {action} {name}" if name else None
+        else:
+            command = action_map.get(action)
         if not command:
             logger.debug("LINE postback ignored: {}", data)
             return
@@ -383,6 +598,153 @@ class LineChannel(BaseChannel):
             content=command,
             metadata={"line": {"source_type": source_type}},
         )
+
+    async def _setup_rich_menus(self) -> None:
+        """Create admin and normal Rich Menus via LINE API."""
+        if not self._http:
+            return
+        try:
+            # Delete existing rich menus to avoid accumulation
+            resp = await self._http.get(
+                f"{LINE_API_BASE}/richmenu/list",
+                headers=self._auth_headers,
+            )
+            if resp.status_code == 200:
+                for rm in resp.json().get("richmenus", []):
+                    name = rm.get("name", "")
+                    if name in ("nanobot_admin", "nanobot_normal"):
+                        await self._http.delete(
+                            f"{LINE_API_BASE}/richmenu/{rm['richMenuId']}",
+                            headers=self._auth_headers,
+                        )
+
+            # Admin Rich Menu: 2x3 grid (2500x1686)
+            # Row 1: Admin | Tool Mode | New Chat
+            # Row 2: Consolidate | Cleanup | Help
+            hw = 833   # cell width (2500/3)
+            hh = 843   # cell height (1686/2)
+            admin_menu = {
+                "size": {"width": 2500, "height": 1686},
+                "selected": True,
+                "name": "nanobot_admin",
+                "chatBarText": "Menu",
+                "areas": [
+                    {"bounds": {"x": 0, "y": 0, "width": hw, "height": hh},
+                     "action": {"type": "postback", "label": "Admin", "data": "action=admin_panel",
+                                "displayText": "/admin panel"}},
+                    {"bounds": {"x": hw, "y": 0, "width": hw + 1, "height": hh},
+                     "action": {"type": "postback", "label": "Tool Mode", "data": "action=tool",
+                                "displayText": "/tool"}},
+                    {"bounds": {"x": hw * 2, "y": 0, "width": hw + 1, "height": hh},
+                     "action": {"type": "postback", "label": "New Chat", "data": "action=new",
+                                "displayText": "/new"}},
+                    {"bounds": {"x": 0, "y": hh, "width": hw, "height": hh},
+                     "action": {"type": "postback", "label": "Consolidate", "data": "action=consolidate",
+                                "displayText": "/consolidate"}},
+                    {"bounds": {"x": hw, "y": hh, "width": hw + 1, "height": hh},
+                     "action": {"type": "postback", "label": "Cleanup", "data": "action=cleanup",
+                                "displayText": "/cleanup"}},
+                    {"bounds": {"x": hw * 2, "y": hh, "width": hw + 1, "height": hh},
+                     "action": {"type": "message", "label": "Help", "text": "/help"}},
+                ],
+            }
+            resp = await self._http.post(
+                f"{LINE_API_BASE}/richmenu",
+                headers=self._auth_headers,
+                json=admin_menu,
+            )
+            if resp.status_code == 200:
+                self._rich_menu_admin = resp.json().get("richMenuId")
+                await self._upload_rich_menu_image(self._rich_menu_admin, [
+                    [("Admin", (30, 120, 70)), ("Tool Mode", (50, 90, 160)), ("New Chat", (80, 80, 90))],
+                    [("Consolidate", (120, 90, 40)), ("Cleanup", (140, 60, 60)), ("Help", (60, 60, 80))],
+                ])
+                logger.info("Created admin Rich Menu: {}", self._rich_menu_admin)
+
+            # Normal Rich Menu: 2x2 grid (2500x1686)
+            # Row 1: New Chat | Help
+            # Row 2: Consolidate | Cleanup
+            nhw = 1250  # cell width (2500/2)
+            normal_menu = {
+                "size": {"width": 2500, "height": 1686},
+                "selected": True,
+                "name": "nanobot_normal",
+                "chatBarText": "Menu",
+                "areas": [
+                    {"bounds": {"x": 0, "y": 0, "width": nhw, "height": hh},
+                     "action": {"type": "postback", "label": "New Chat", "data": "action=new",
+                                "displayText": "/new"}},
+                    {"bounds": {"x": nhw, "y": 0, "width": nhw, "height": hh},
+                     "action": {"type": "message", "label": "Help", "text": "/help"}},
+                    {"bounds": {"x": 0, "y": hh, "width": nhw, "height": hh},
+                     "action": {"type": "postback", "label": "Consolidate", "data": "action=consolidate",
+                                "displayText": "/consolidate"}},
+                    {"bounds": {"x": nhw, "y": hh, "width": nhw, "height": hh},
+                     "action": {"type": "postback", "label": "Cleanup", "data": "action=cleanup",
+                                "displayText": "/cleanup"}},
+                ],
+            }
+            resp = await self._http.post(
+                f"{LINE_API_BASE}/richmenu",
+                headers=self._auth_headers,
+                json=normal_menu,
+            )
+            if resp.status_code == 200:
+                self._rich_menu_normal = resp.json().get("richMenuId")
+                await self._upload_rich_menu_image(self._rich_menu_normal, [
+                    [("New Chat", (50, 90, 160)), ("Help", (60, 60, 80))],
+                    [("Consolidate", (120, 90, 40)), ("Cleanup", (140, 60, 60))],
+                ])
+                # Set as default for all users
+                await self._http.post(
+                    f"{LINE_API_BASE}/user/all/richmenu/{self._rich_menu_normal}",
+                    headers=self._auth_headers,
+                )
+                logger.info("Created normal Rich Menu (default): {}", self._rich_menu_normal)
+
+        except Exception as e:
+            logger.warning("Failed to setup Rich Menus: {}", e)
+
+    async def _upload_rich_menu_image(
+        self, menu_id: str, rows: list[list[tuple[str, tuple[int, int, int]]]],
+    ) -> None:
+        """Upload a PNG image with labeled colored cells for a Rich Menu.
+
+        Args:
+            menu_id: Rich Menu ID to upload to.
+            rows: List of rows, each row is a list of (label, (r, g, b)) cells.
+        """
+        if not self._http or not menu_id:
+            return
+        try:
+            img_height = 843 * len(rows)
+            png = _render_rich_menu_png(2500, img_height, rows)
+            resp = await self._http.post(
+                f"{LINE_DATA_API}/richmenu/{menu_id}/content",
+                headers={
+                    "Authorization": f"Bearer {self.config.channel_access_token}",
+                    "Content-Type": "image/png",
+                },
+                content=png,
+            )
+            if resp.status_code != 200:
+                logger.warning("Rich Menu image upload failed ({}): {}", resp.status_code, resp.text[:200])
+        except Exception as e:
+            logger.warning("Rich Menu image upload error: {}", e)
+
+    async def _link_rich_menu(self, user_id: str, menu_id: str) -> None:
+        """Link a Rich Menu to a specific user."""
+        if not self._http or not menu_id:
+            return
+        try:
+            resp = await self._http.post(
+                f"{LINE_API_BASE}/user/{user_id}/richmenu/{menu_id}",
+                headers=self._auth_headers,
+            )
+            if resp.status_code != 200:
+                logger.warning("Rich Menu link failed ({}): {}", resp.status_code, resp.text[:200])
+        except Exception as e:
+            logger.warning("Rich Menu link error: {}", e)
 
     async def _handle_media(
         self,

@@ -294,6 +294,11 @@ def gateway(
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 
+    # Access control for gateway
+    from nanobot.agent.access import AccessManager
+    access = AccessManager(config.workspace_path)
+    access.seed_passphrase(config.agents.defaults.admin_passphrase)
+
     # Create agent with cron service
     agent = AgentLoop(
         bus=bus,
@@ -318,6 +323,7 @@ def gateway(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         parallel=config.agents.defaults.parallel,
+        access=access,
     )
 
     # Set cron callback (needs agent)
@@ -487,6 +493,15 @@ def agent(
     else:
         logger.disable("nanobot")
 
+    # Access control: CLI user is always admin
+    from nanobot.agent.access import AccessManager
+    access = AccessManager(config.workspace_path)
+    access.seed_passphrase(config.agents.defaults.admin_passphrase)
+    if not access.is_admin("user"):
+        admins = access._data.setdefault("admins", [])
+        admins.append("user")
+        access._save()
+
     agent_loop = AgentLoop(
         bus=bus,
         provider=provider,
@@ -508,6 +523,7 @@ def agent(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         parallel=config.agents.defaults.parallel,
+        access=access,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on

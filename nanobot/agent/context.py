@@ -55,6 +55,7 @@ Keep each fact concise — one clear statement per tag."""
         include_escalation: bool = False,
         include_memory: bool = True,
         sender_id: str | None = None,
+        allowed_skills: list[str] | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity()]
@@ -72,12 +73,14 @@ Keep each fact concise — one clear statement per tag."""
 
         if include_skills:
             always_skills = self.skills.get_always_skills()
+            if allowed_skills is not None:
+                always_skills = [s for s in always_skills if s in allowed_skills]
             if always_skills:
                 always_content = self.skills.load_skills_for_context(always_skills)
                 if always_content:
                     parts.append(f"# Active Skills\n\n{always_content}")
 
-            skills_summary = self.skills.build_skills_summary()
+            skills_summary = self.skills.build_skills_summary(allowed=allowed_skills)
             if skills_summary:
                 parts.append(f"""# Skills
 
@@ -151,6 +154,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         include_skills: bool = True,
         include_escalation: bool = False,
         sender_id: str | None = None,
+        allowed_skills: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(channel, chat_id)
@@ -168,6 +172,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
                 skill_names, include_skills=include_skills,
                 include_escalation=include_escalation,
                 sender_id=sender_id,
+                allowed_skills=allowed_skills,
             )},
             *history,
             {"role": "user", "content": merged},

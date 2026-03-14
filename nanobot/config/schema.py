@@ -46,6 +46,7 @@ class AgentDefaults(Base):
     max_context_items: int = 20  # max history messages sent to LLM
     reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
     parallel: bool = False  # True: per-session parallel processing; False: single global lock
+    admin_passphrase: str = ""  # Seeds access.json on first run for RBAC authentication
 
 
 class AgentsConfig(Base):
