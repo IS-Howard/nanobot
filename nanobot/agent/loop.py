@@ -227,6 +227,7 @@ class AgentLoop:
         use_tools: bool = True,
         model: str | None = None,
         allowed_tools: list[str] | None = None,
+        on_busy: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
         messages = initial_messages
@@ -240,6 +241,13 @@ class AgentLoop:
 
         while iteration < self.max_iterations:
             iteration += 1
+
+            # Refresh busy indicator each iteration (loading animation expires)
+            if on_busy and iteration > 1:
+                try:
+                    await on_busy()
+                except Exception:
+                    pass
 
             msg_chars = sum(
                 len(m.get("content") or "") if isinstance(m.get("content"), str)
@@ -660,11 +668,17 @@ class AgentLoop:
 
         progress_cb = on_progress or _bus_progress
 
+        async def _refresh_busy() -> None:
+            await self._send_busy_notification(msg)
+
+        busy_cb = _refresh_busy if msg.channel != "cli" else None
+
         # Auto-escalation: free model detects tool need -> switch to tool model
         if can_escalate:
             # Pass 1: free model, no tools, lightweight prompt
             final_content, _, all_msgs = await self._run_agent_loop(
                 initial_messages, on_progress=progress_cb, use_tools=False, model=self.model,
+                on_busy=busy_cb,
             )
             # Check for escalation trigger
             if final_content:
@@ -686,12 +700,14 @@ class AgentLoop:
                         initial_messages, on_progress=progress_cb,
                         use_tools=True, model=self.tool_model,
                         allowed_tools=allowed_tools,
+                        on_busy=busy_cb,
                     )
         else:
             final_content, _, all_msgs = await self._run_agent_loop(
                 initial_messages, on_progress=progress_cb,
                 use_tools=use_tools, model=active_model,
                 allowed_tools=allowed_tools if use_tools else None,
+                on_busy=busy_cb,
             )
 
         if final_content is None:
