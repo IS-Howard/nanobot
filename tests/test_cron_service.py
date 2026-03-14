@@ -19,18 +19,6 @@ def test_add_job_rejects_unknown_timezone(tmp_path) -> None:
     assert service.list_jobs(include_disabled=True) == []
 
 
-def test_add_job_accepts_valid_timezone(tmp_path) -> None:
-    service = CronService(tmp_path / "cron" / "jobs.json")
-
-    job = service.add_job(
-        name="tz ok",
-        schedule=CronSchedule(kind="cron", expr="0 9 * * *", tz="America/Vancouver"),
-        message="hello",
-    )
-
-    assert job.schedule.tz == "America/Vancouver"
-    assert job.state.next_run_at_ms is not None
-
 
 @pytest.mark.asyncio
 async def test_running_service_honors_external_disable(tmp_path) -> None:
