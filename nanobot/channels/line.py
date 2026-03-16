@@ -21,6 +21,7 @@ from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import LineConfig
 
 if TYPE_CHECKING:
+    from nanobot.agent.access import AccessManager
     from nanobot.storage.postgres import PostgresStorage
 
 LINE_API_BASE = "https://api.line.me/v2/bot"
@@ -329,6 +330,7 @@ class LineChannel(BaseChannel):
         bus: MessageBus,
         storage: PostgresStorage | None = None,
         max_files_per_session: int = 2,
+        access: AccessManager | None = None,
     ):
         super().__init__(config, bus)
         self.config: LineConfig = config
@@ -336,6 +338,7 @@ class LineChannel(BaseChannel):
         self._http: httpx.AsyncClient | None = None
         self._storage = storage
         self._max_files = max_files_per_session
+        self._access = access
         self._rich_menu_admin: str | None = None
         self._rich_menu_normal: str | None = None
 
@@ -701,6 +704,14 @@ class LineChannel(BaseChannel):
                     headers=self._auth_headers,
                 )
                 logger.info("Created normal Rich Menu (default): {}", self._rich_menu_normal)
+
+            # Re-link admin menu to known admin users
+            if self._rich_menu_admin and self._access:
+                admins = self._access._data.get("admins", [])
+                for uid in admins:
+                    await self._link_rich_menu(uid, self._rich_menu_admin)
+                if admins:
+                    logger.info("Re-linked admin Rich Menu for {} user(s)", len(admins))
 
         except Exception as e:
             logger.warning("Failed to setup Rich Menus: {}", e)

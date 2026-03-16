@@ -372,6 +372,7 @@ def gateway(
         config, bus,
         storage=storage,
         max_files_per_session=config.database.max_files_per_session,
+        access=access,
     )
 
     def _pick_heartbeat_target() -> tuple[str, str]:

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from nanobot.bus.queue import MessageBus
+
+if TYPE_CHECKING:
+    from nanobot.agent.access import AccessManager
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config
 
@@ -28,11 +31,13 @@ class ChannelManager:
         bus: MessageBus,
         storage: Any | None = None,
         max_files_per_session: int = 2,
+        access: AccessManager | None = None,
     ):
         self.config = config
         self.bus = bus
         self._storage = storage
         self._max_files = max_files_per_session
+        self._access = access
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
 
@@ -49,6 +54,7 @@ class ChannelManager:
                     self.config.channels.line, self.bus,
                     storage=self._storage,
                     max_files_per_session=self._max_files,
+                    access=self._access,
                 )
                 logger.info("LINE channel enabled")
             except ImportError as e:
