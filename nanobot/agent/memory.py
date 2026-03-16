@@ -19,6 +19,13 @@ _MEMORIZE_GLOBAL_RE = re.compile(r"<memorize_global>(.*?)</memorize_global>", re
 _MEMORIZE_USER_RE = re.compile(r"<memorize_user>(.*?)</memorize_user>", re.DOTALL)
 
 
+def _strip_memorize_tags(text: str) -> str:
+    """Remove any <memorize_global>/<memorize_user> tags from text."""
+    text = _MEMORIZE_GLOBAL_RE.sub("", text)
+    text = _MEMORIZE_USER_RE.sub("", text)
+    return text.strip()
+
+
 def extract_memorize_tags(text: str) -> tuple[str, list[str], list[str]]:
     """Extract <memorize_global> and <memorize_user> tags from LLM response.
 
@@ -150,6 +157,7 @@ Return ONLY a JSON object with two keys:
 Rules:
 - Include existing memory facts plus any new ones from the conversation.
 - If nothing new is worth remembering for a section, return that section unchanged.
+- PRESERVE the original language of each fact — do NOT translate.
 - Do NOT store tool names, skill names, bot capabilities, or system features.
 - Do NOT duplicate anything already in the System Prompt section below.
 - Return ONLY valid JSON, no explanation, no code fences.{topic_instruction}{system_context}
@@ -166,7 +174,7 @@ Rules:
         try:
             response = await provider.chat(
                 messages=[
-                    {"role": "system", "content": 'You are a memory consolidation agent. Return ONLY a JSON object with "global" and "user" keys, each containing markdown text. No explanation, no code fences.'},
+                    {"role": "system", "content": 'You are a memory consolidation agent. Return ONLY a JSON object with "global" and "user" keys, each containing markdown text. No explanation, no code fences. CRITICAL: Keep each fact in its original language — never translate.'},
                     {"role": "user", "content": prompt},
                 ],
                 model=model,
@@ -182,8 +190,8 @@ Rules:
                 logger.error("Memory consolidation: failed to parse JSON: {}", raw[:200])
                 return False
 
-            global_update = result.get("global", "").strip()
-            user_update = result.get("user", "").strip()
+            global_update = _strip_memorize_tags(result.get("global", "")).strip()
+            user_update = _strip_memorize_tags(result.get("user", "")).strip()
 
             if global_update and global_update != current_global.strip():
                 self.write_global_memory(global_update)
@@ -236,6 +244,7 @@ Rules:
 - Merge related facts into concise statements.
 - Remove outdated or contradicted entries.
 - Preserve all unique, valuable facts.
+- PRESERVE the original language of each fact — do NOT translate.
 - Return ONLY valid JSON, no explanation, no code fences.{system_context}
 
 ## Current Global Memory (IDENTITY.md)
@@ -247,7 +256,7 @@ Rules:
         try:
             response = await provider.chat(
                 messages=[
-                    {"role": "system", "content": 'You are a memory cleanup agent. Return ONLY a JSON object with "global" and "user" keys, each containing compacted markdown text. No explanation, no code fences.'},
+                    {"role": "system", "content": 'You are a memory cleanup agent. Return ONLY a JSON object with "global" and "user" keys, each containing compacted markdown text. No explanation, no code fences. CRITICAL: Keep each fact in its original language — never translate.'},
                     {"role": "user", "content": prompt},
                 ],
                 model=model,
@@ -263,8 +272,8 @@ Rules:
                 logger.error("Memory cleanup: failed to parse JSON: {}", raw[:200])
                 return False
 
-            global_update = result.get("global", "").strip()
-            user_update = result.get("user", "").strip()
+            global_update = _strip_memorize_tags(result.get("global", "")).strip()
+            user_update = _strip_memorize_tags(result.get("user", "")).strip()
 
             if global_update and global_update != current_global.strip():
                 self.write_global_memory(global_update)
