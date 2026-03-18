@@ -9,6 +9,7 @@ import hmac
 import json
 import mimetypes
 import tempfile
+import time
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -28,6 +29,7 @@ LINE_API_BASE = "https://api.line.me/v2/bot"
 LINE_DATA_API = "https://api-data.line.me/v2/bot"
 LINE_MAX_TEXT = 5000
 LINE_MAX_MESSAGES_PER_PUSH = 5
+LINE_REPLY_TOKEN_TTL = 20  # seconds; LINE tokens expire at ~30s, use 20s for safety
 
 # msg_type -> (mime_type, extension)
 _MIME_MAP: dict[str, tuple[str, str]] = {
@@ -341,6 +343,12 @@ class LineChannel(BaseChannel):
         self._access = access
         self._rich_menu_admin: str | None = None
         self._rich_menu_normal: str | None = None
+        self._rich_menu_admin_queued: str | None = None
+        self._rich_menu_normal_queued: str | None = None
+        # reply_token cache: chat_id -> (token, received_time)
+        self._reply_tokens: dict[str, tuple[str, float]] = {}
+        # Per-chat message queue for 429 rate-limit fallback
+        self._pending_queues: dict[str, list[dict[str, Any]]] = {}
 
     async def start(self) -> None:
         """Start webhook server and listen for LINE events."""
@@ -399,7 +407,7 @@ class LineChannel(BaseChannel):
             self._http = None
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a message to LINE via push message API."""
+        """Send a message to LINE via reply API (free); queue remainder for user retrieval."""
         if not self._http:
             logger.warning("LINE client not running")
             return
@@ -441,10 +449,19 @@ class LineChannel(BaseChannel):
         if not messages:
             return
 
-        # LINE allows max 5 messages per push call
-        for i in range(0, len(messages), LINE_MAX_MESSAGES_PER_PUSH):
-            batch = messages[i : i + LINE_MAX_MESSAGES_PER_PUSH]
-            await self._push_messages(msg.chat_id, batch)
+        # Try reply API first (free)
+        token_entry = self._reply_tokens.pop(msg.chat_id, None)
+        if token_entry and not is_progress:
+            token, ts = token_entry
+            if time.monotonic() - ts < LINE_REPLY_TOKEN_TTL:
+                first_batch = messages[:LINE_MAX_MESSAGES_PER_PUSH]
+                replied = await self._reply_messages(token, first_batch)
+                if replied:
+                    messages = messages[LINE_MAX_MESSAGES_PER_PUSH:]
+
+        # Queue any remaining messages for user retrieval via "." / Continue
+        if messages:
+            self._queue_messages(msg.chat_id, messages)
 
     # ── Webhook handling ──────────────────────────────────────────────
 
@@ -536,11 +553,27 @@ class LineChannel(BaseChannel):
         if not content:
             return
 
+        reply_token = event.get("replyToken", "")
+
+        # "." is a dedicated flush trigger — never forward to agent
+        if content.strip() == ".":
+            if self._pending_queues.get(chat_id) and reply_token:
+                await self._flush_queue(chat_id, reply_token)
+            return
+
+        # If there are queued messages, use the reply token to flush them
+        # instead of saving it for the agent response.
+        if self._pending_queues.get(chat_id) and reply_token:
+            await self._flush_queue(chat_id, reply_token)
+            # Token consumed — agent response will be queued too
+            reply_token = ""
+
         # Show loading animation (fire-and-forget)
         if msg_type == "text":
             asyncio.create_task(self._show_loading(chat_id))
 
-        reply_token = event.get("replyToken", "")
+        if reply_token:
+            self._reply_tokens[chat_id] = (reply_token, time.monotonic())
 
         logger.debug(
             "LINE message: type={} sender={} chat={} text={}",
@@ -572,6 +605,21 @@ class LineChannel(BaseChannel):
         }
         params = dict(p.split("=", 1) for p in data.split("&") if "=" in p)
         action = params.get("action", "")
+
+        # Handle "continue" postback — flush queued messages
+        if action == "continue":
+            source = event.get("source", {})
+            sender_id = source.get("userId", "")
+            source_type = source.get("type", "")
+            if source_type == "group":
+                chat_id = source.get("groupId", sender_id)
+            elif source_type == "room":
+                chat_id = source.get("roomId", sender_id)
+            else:
+                chat_id = sender_id
+            reply_token = event.get("replyToken", "")
+            await self._flush_queue(chat_id, reply_token)
+            return
         # Dynamic admin toggle commands
         if action in ("toggle_tool", "toggle_skill"):
             name = params.get("name", "")
@@ -595,11 +643,15 @@ class LineChannel(BaseChannel):
         else:
             chat_id = sender_id
 
+        reply_token = event.get("replyToken", "")
+        if reply_token:
+            self._reply_tokens[chat_id] = (reply_token, time.monotonic())
+
         await self._handle_message(
             sender_id=sender_id,
             chat_id=chat_id,
             content=command,
-            metadata={"line": {"source_type": source_type}},
+            metadata={"line": {"reply_token": reply_token, "source_type": source_type}},
         )
 
     async def _setup_rich_menus(self) -> None:
@@ -615,7 +667,7 @@ class LineChannel(BaseChannel):
             if resp.status_code == 200:
                 for rm in resp.json().get("richmenus", []):
                     name = rm.get("name", "")
-                    if name in ("nanobot_admin", "nanobot_normal"):
+                    if name in ("nanobot_admin", "nanobot_normal", "nanobot_admin_q", "nanobot_normal_q"):
                         await self._http.delete(
                             f"{LINE_API_BASE}/richmenu/{rm['richMenuId']}",
                             headers=self._auth_headers,
@@ -704,6 +756,80 @@ class LineChannel(BaseChannel):
                     headers=self._auth_headers,
                 )
                 logger.info("Created normal Rich Menu (default): {}", self._rich_menu_normal)
+
+            # ── Queued variants (with Continue button) ──────────────
+            # Admin queued: same as admin but Help → Continue
+            admin_queued_menu = {
+                "size": {"width": 2500, "height": 1686},
+                "selected": True,
+                "name": "nanobot_admin_q",
+                "chatBarText": "Menu",
+                "areas": [
+                    {"bounds": {"x": 0, "y": 0, "width": hw, "height": hh},
+                     "action": {"type": "postback", "label": "Admin", "data": "action=admin_panel",
+                                "displayText": "/admin panel"}},
+                    {"bounds": {"x": hw, "y": 0, "width": hw + 1, "height": hh},
+                     "action": {"type": "postback", "label": "Tool Mode", "data": "action=tool",
+                                "displayText": "/tool"}},
+                    {"bounds": {"x": hw * 2, "y": 0, "width": hw + 1, "height": hh},
+                     "action": {"type": "postback", "label": "New Chat", "data": "action=new",
+                                "displayText": "/new"}},
+                    {"bounds": {"x": 0, "y": hh, "width": hw, "height": hh},
+                     "action": {"type": "postback", "label": "Consolidate", "data": "action=consolidate",
+                                "displayText": "/consolidate"}},
+                    {"bounds": {"x": hw, "y": hh, "width": hw + 1, "height": hh},
+                     "action": {"type": "postback", "label": "Cleanup", "data": "action=cleanup",
+                                "displayText": "/cleanup"}},
+                    {"bounds": {"x": hw * 2, "y": hh, "width": hw + 1, "height": hh},
+                     "action": {"type": "postback", "label": "Continue", "data": "action=continue",
+                                "displayText": "."}},
+                ],
+            }
+            resp = await self._http.post(
+                f"{LINE_API_BASE}/richmenu",
+                headers=self._auth_headers,
+                json=admin_queued_menu,
+            )
+            if resp.status_code == 200:
+                self._rich_menu_admin_queued = resp.json().get("richMenuId")
+                await self._upload_rich_menu_image(self._rich_menu_admin_queued, [
+                    [("Admin", (30, 120, 70)), ("Tool Mode", (50, 90, 160)), ("New Chat", (80, 80, 90))],
+                    [("Consolidate", (120, 90, 40)), ("Cleanup", (140, 60, 60)), ("Continue", (0, 120, 60))],
+                ])
+                logger.info("Created admin queued Rich Menu: {}", self._rich_menu_admin_queued)
+
+            # Normal queued: same as normal but Cleanup → Continue
+            normal_queued_menu = {
+                "size": {"width": 2500, "height": 1686},
+                "selected": True,
+                "name": "nanobot_normal_q",
+                "chatBarText": "Menu",
+                "areas": [
+                    {"bounds": {"x": 0, "y": 0, "width": nhw, "height": hh},
+                     "action": {"type": "postback", "label": "New Chat", "data": "action=new",
+                                "displayText": "/new"}},
+                    {"bounds": {"x": nhw, "y": 0, "width": nhw, "height": hh},
+                     "action": {"type": "message", "label": "Help", "text": "/help"}},
+                    {"bounds": {"x": 0, "y": hh, "width": nhw, "height": hh},
+                     "action": {"type": "postback", "label": "Consolidate", "data": "action=consolidate",
+                                "displayText": "/consolidate"}},
+                    {"bounds": {"x": nhw, "y": hh, "width": nhw, "height": hh},
+                     "action": {"type": "postback", "label": "Continue", "data": "action=continue",
+                                "displayText": "."}},
+                ],
+            }
+            resp = await self._http.post(
+                f"{LINE_API_BASE}/richmenu",
+                headers=self._auth_headers,
+                json=normal_queued_menu,
+            )
+            if resp.status_code == 200:
+                self._rich_menu_normal_queued = resp.json().get("richMenuId")
+                await self._upload_rich_menu_image(self._rich_menu_normal_queued, [
+                    [("New Chat", (50, 90, 160)), ("Help", (60, 60, 80))],
+                    [("Consolidate", (120, 90, 40)), ("Continue", (0, 120, 60))],
+                ])
+                logger.info("Created normal queued Rich Menu: {}", self._rich_menu_normal_queued)
 
             # Re-link admin menu to known admin users
             if self._rich_menu_admin and self._access:
@@ -860,20 +986,78 @@ class LineChannel(BaseChannel):
         except Exception as e:
             logger.warning("LINE loading API error: {}", e)
 
-    async def _push_messages(self, to: str, messages: list[dict[str, Any]]) -> None:
-        """Push messages to a user/group via LINE Messaging API."""
+    async def _reply_messages(self, reply_token: str, messages: list[dict[str, Any]]) -> bool:
+        """Reply to a message using LINE reply API (free, no quota cost).
+
+        Returns True if reply succeeded, False otherwise.
+        """
         if not self._http:
-            return
+            return False
         try:
             resp = await self._http.post(
-                f"{LINE_API_BASE}/message/push",
+                f"{LINE_API_BASE}/message/reply",
                 headers=self._auth_headers,
-                json={"to": to, "messages": messages},
+                json={"replyToken": reply_token, "messages": messages},
             )
-            if resp.status_code != 200:
-                logger.error("LINE push failed ({}): {}", resp.status_code, resp.text)
+            if resp.status_code == 200:
+                logger.debug("LINE reply succeeded")
+                return True
+            logger.warning("LINE reply failed ({}): {}", resp.status_code, resp.text[:200])
+            return False
         except Exception as e:
-            logger.error("LINE push error: {}", e)
+            logger.warning("LINE reply error: {}", e)
+            return False
+
+    def _queue_messages(self, chat_id: str, messages: list[dict[str, Any]]) -> None:
+        """Add messages to the pending queue and show Continue rich menu."""
+        had_queue = bool(self._pending_queues.get(chat_id))
+        self._pending_queues.setdefault(chat_id, []).extend(messages)
+        logger.info("LINE queued {} message(s) for {} (total: {})",
+                     len(messages), chat_id, len(self._pending_queues[chat_id]))
+        if not had_queue:
+            asyncio.create_task(self._swap_to_queued_menu(chat_id))
+
+    async def _flush_queue(self, chat_id: str, reply_token: str | None = None) -> bool:
+        """Flush queued messages for a chat using the reply API (free).
+
+        Returns True if there were messages to flush.
+        """
+        queue = self._pending_queues.get(chat_id)
+        if not queue:
+            return False
+
+        if reply_token:
+            send_count = min(len(queue), LINE_MAX_MESSAGES_PER_PUSH)
+            batch = queue[:send_count]
+            ok = await self._reply_messages(reply_token, batch)
+            if ok:
+                del queue[:send_count]
+
+        if not queue:
+            del self._pending_queues[chat_id]
+            asyncio.create_task(self._swap_to_normal_menu(chat_id))
+        else:
+            logger.info("LINE queue for {}: {} message(s) remaining", chat_id, len(queue))
+
+        return True
+
+    async def _swap_to_queued_menu(self, chat_id: str) -> None:
+        """Switch user to the rich menu with Continue button."""
+        menu = self._rich_menu_admin_queued if self._is_admin(chat_id) else self._rich_menu_normal_queued
+        if menu:
+            await self._link_rich_menu(chat_id, menu)
+
+    async def _swap_to_normal_menu(self, chat_id: str) -> None:
+        """Switch user back to the normal rich menu."""
+        menu = self._rich_menu_admin if self._is_admin(chat_id) else self._rich_menu_normal
+        if menu:
+            await self._link_rich_menu(chat_id, menu)
+
+    def _is_admin(self, chat_id: str) -> bool:
+        """Check if a user is admin via access manager."""
+        if not self._access:
+            return False
+        return chat_id in self._access._data.get("admins", [])
 
 
 def _split_text(text: str, limit: int = LINE_MAX_TEXT) -> list[str]:
