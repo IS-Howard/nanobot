@@ -986,6 +986,10 @@ class LineChannel(BaseChannel):
         if task:
             task.cancel()
 
+    def clear_busy(self, chat_id: str) -> None:
+        """Cancel the loading animation for a chat."""
+        self._cancel_loading(chat_id)
+
     async def _loading_keep_alive(self, chat_id: str) -> None:
         """Repeatedly send loading animation every 25s until cancelled."""
         try:

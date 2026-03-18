@@ -338,22 +338,28 @@ class AgentLoop:
             except asyncio.TimeoutError:
                 continue
 
-            if msg.content.strip().lower() == "/stop":
+            cmd = msg.content.strip().lower()
+            if cmd == "/stop":
                 await self._handle_stop(msg)
-            else:
-                # Notify user if agent is busy processing
-                is_busy = (msg.session_key in self._busy_sessions
-                           if self.parallel else bool(self._busy_sessions))
-                if is_busy:
-                    logger.info("Session {} is busy, sending busy notification", msg.session_key)
-                    await self._send_busy_notification(msg)
-                # Mark session as busy before dispatching to avoid race conditions
-                self._busy_sessions.add(msg.session_key)
-                task = asyncio.create_task(self._dispatch(msg))
-                self._active_tasks.setdefault(msg.session_key, []).append(task)
-                task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+                continue
 
-    async def _handle_stop(self, msg: InboundMessage) -> None:
+            # /new cancels active tasks before clearing session
+            if cmd == "/new":
+                await self._handle_stop(msg, silent=True)
+
+            # Notify user if agent is busy processing
+            is_busy = (msg.session_key in self._busy_sessions
+                       if self.parallel else bool(self._busy_sessions))
+            if is_busy:
+                logger.info("Session {} is busy, sending busy notification", msg.session_key)
+                await self._send_busy_notification(msg)
+            # Mark session as busy before dispatching to avoid race conditions
+            self._busy_sessions.add(msg.session_key)
+            task = asyncio.create_task(self._dispatch(msg))
+            self._active_tasks.setdefault(msg.session_key, []).append(task)
+            task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+
+    async def _handle_stop(self, msg: InboundMessage, *, silent: bool = False) -> None:
         """Cancel all active tasks and subagents for the session."""
         tasks = self._active_tasks.pop(msg.session_key, [])
         cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
@@ -363,6 +369,8 @@ class AgentLoop:
             except (asyncio.CancelledError, Exception):
                 pass
         sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
+        if silent:
+            return
         total = cancelled + sub_cancelled
         content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
         await self.bus.publish_outbound(OutboundMessage(
@@ -402,6 +410,11 @@ class AgentLoop:
                 ))
             finally:
                 self._busy_sessions.discard(msg.session_key)
+                if msg.channel != "cli":
+                    self.bus.outbound.put_nowait(OutboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id,
+                        content="", metadata={"_cancel_busy": True},
+                    ))
 
     def _coalesce(self, msg: InboundMessage) -> InboundMessage:
         """Drain the inbound queue and coalesce messages from the same user.

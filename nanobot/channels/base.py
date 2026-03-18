@@ -117,6 +117,10 @@ class BaseChannel(ABC):
         """Show a busy/typing indicator. Override in subclasses for channel-specific behavior."""
         pass
 
+    def clear_busy(self, chat_id: str) -> None:
+        """Cancel any busy/typing indicator. Override in subclasses for channel-specific behavior."""
+        pass
+
     @property
     def is_running(self) -> bool:
         """Check if the channel is running."""

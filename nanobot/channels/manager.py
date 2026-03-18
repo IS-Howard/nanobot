@@ -126,6 +126,12 @@ class ChannelManager:
                     timeout=1.0
                 )
 
+                if msg.metadata.get("_cancel_busy"):
+                    channel = self.channels.get(msg.channel)
+                    if channel:
+                        channel.clear_busy(msg.chat_id)
+                    continue
+
                 if msg.metadata.get("_busy"):
                     channel = self.channels.get(msg.channel)
                     if channel:
