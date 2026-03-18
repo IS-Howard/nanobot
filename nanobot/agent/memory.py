@@ -157,6 +157,7 @@ Return ONLY a JSON object with two keys:
 Rules:
 - Include existing memory facts plus any new ones from the conversation.
 - If nothing new is worth remembering for a section, return that section unchanged.
+- Do NOT add facts to User Memory that are already in Global Memory.
 - PRESERVE the original language of each fact — do NOT translate.
 - Do NOT store tool names, skill names, bot capabilities, or system features.
 - Do NOT duplicate anything already in the System Prompt section below.
@@ -240,11 +241,13 @@ Return ONLY a JSON object with two keys:
 - "user": compacted per-user memory
 
 Rules:
+- Remove entries from User Memory that duplicate info already in Global Memory.
 - Remove entries that duplicate info in the System Prompt section below.
 - Merge related facts into concise statements.
 - Remove outdated or contradicted entries.
 - Preserve all unique, valuable facts.
 - PRESERVE the original language of each fact — do NOT translate.
+- If a section becomes empty after cleanup, return "(empty)" for that key.
 - Return ONLY valid JSON, no explanation, no code fences.{system_context}
 
 ## Current Global Memory (IDENTITY.md)
@@ -275,11 +278,17 @@ Rules:
             global_update = _strip_memorize_tags(result.get("global", "")).strip()
             user_update = _strip_memorize_tags(result.get("user", "")).strip()
 
-            if global_update and global_update != current_global.strip():
+            # Treat "(empty)" as blank
+            if global_update.lower() == "(empty)":
+                global_update = ""
+            if user_update.lower() == "(empty)":
+                user_update = ""
+
+            if global_update != current_global.strip():
                 self.write_global_memory(global_update)
                 logger.info("Global memory (IDENTITY.md) cleaned up")
 
-            if user_update and user_update != current_user.strip():
+            if user_update != current_user.strip():
                 self.write_user_memory(sender_id, user_update)
                 logger.info("User memory cleaned up for {}", sender_id)
 
