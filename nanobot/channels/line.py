@@ -349,6 +349,8 @@ class LineChannel(BaseChannel):
         self._reply_tokens: dict[str, tuple[str, float]] = {}
         # Per-chat message queue for 429 rate-limit fallback
         self._pending_queues: dict[str, list[dict[str, Any]]] = {}
+        # Loading animation keep-alive tasks per chat
+        self._loading_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def start(self) -> None:
         """Start webhook server and listen for LINE events."""
@@ -413,6 +415,8 @@ class LineChannel(BaseChannel):
             return
 
         is_progress = msg.metadata.get("_progress", False)
+        if not is_progress:
+            self._cancel_loading(msg.chat_id)
         messages: list[dict[str, Any]] = []
 
         # Check if content should be upgraded to Flex Message
@@ -967,12 +971,32 @@ class LineChannel(BaseChannel):
         return None
 
     async def show_busy(self, chat_id: str) -> None:
-        """Show LINE loading animation when agent is busy."""
+        """Show LINE loading animation and keep it alive until the next show_busy or send."""
         logger.debug("LINE show_busy for chat_id={}", chat_id)
-        await self._show_loading(chat_id)
+        # Cancel any existing keep-alive loop for this chat
+        old_task = self._loading_tasks.pop(chat_id, None)
+        if old_task:
+            old_task.cancel()
+        # Start a new keep-alive loop
+        self._loading_tasks[chat_id] = asyncio.create_task(self._loading_keep_alive(chat_id))
+
+    def _cancel_loading(self, chat_id: str) -> None:
+        """Cancel the loading keep-alive loop for a chat."""
+        task = self._loading_tasks.pop(chat_id, None)
+        if task:
+            task.cancel()
+
+    async def _loading_keep_alive(self, chat_id: str) -> None:
+        """Repeatedly send loading animation every 25s until cancelled."""
+        try:
+            while True:
+                await self._show_loading(chat_id)
+                await asyncio.sleep(25)
+        except asyncio.CancelledError:
+            pass
 
     async def _show_loading(self, chat_id: str) -> None:
-        """Show loading animation in LINE chat."""
+        """Show loading animation in LINE chat (lasts 30s)."""
         if not self._http:
             return
         try:
