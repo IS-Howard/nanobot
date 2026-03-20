@@ -239,6 +239,10 @@ _FONT: dict[str, list[int]] = {
 def _render_rich_menu_png(
     width: int, height: int,
     rows: list[list[tuple[str, tuple[int, int, int]]]],
+    *,
+    row_heights: list[int] | None = None,
+    tab_row: int | None = None,
+    active_tab: int | None = None,
 ) -> bytes:
     """Render a Rich Menu PNG with labeled colored cells arranged in rows.
 
@@ -247,41 +251,144 @@ def _render_rich_menu_png(
         height: Image height in pixels.
         rows: List of rows, each row is a list of (label, (r, g, b)) cells.
               Cells in each row are evenly divided across the width.
+        row_heights: Optional list of pixel heights per row. If None, rows are equal.
+        tab_row: Index of the row to render as tabs (with 3D pressed/released effect).
+        active_tab: Index of the active (pressed) tab cell in the tab row.
     """
     import struct
     import zlib
 
     scale = 8   # each font pixel = 8x8 real pixels
     gap = 4     # px separator between cells
+    bevel = 8   # 3D border thickness for tabs
+    corner_r = 24  # rounded corner radius for tabs
+    tab_gap = 10   # gap between tab cells (filled with strip bg)
 
     pixels = bytearray(width * height * 3)
     num_rows = len(rows)
-    row_height = height // num_rows
+
+    # Calculate row positions
+    if row_heights and len(row_heights) == num_rows:
+        y_starts = []
+        acc = 0
+        for h in row_heights:
+            y_starts.append(acc)
+            acc += h
+        rh_list = list(row_heights)
+    else:
+        rh = height // num_rows
+        y_starts = [ri * rh for ri in range(num_rows)]
+        rh_list = [rh] * num_rows
 
     for ri, row in enumerate(rows):
-        y0 = ri * row_height
-        y1 = y0 + row_height if ri < num_rows - 1 else height
+        y0 = y_starts[ri]
+        y1 = y0 + rh_list[ri] if ri < num_rows - 1 else height
         cell_width = width // len(row)
+        is_tab = (ri == tab_row and active_tab is not None)
+
+        # Fill tab strip background first
+        if is_tab:
+            strip_bg = bytes((35, 35, 40))
+            for y in range(y0, y1):
+                for x in range(width):
+                    off = (y * width + x) * 3
+                    pixels[off:off + 3] = strip_bg
 
         for ci, (label, (r, g, b)) in enumerate(row):
             x0 = ci * cell_width
             x1 = x0 + cell_width if ci < len(row) - 1 else width
 
-            # Fill cell background with separators
-            for y in range(y0, y1):
-                for x in range(x0, x1):
-                    is_sep = ((x < x0 + gap // 2 and ci > 0)
-                              or (y < y0 + gap // 2 and ri > 0))
-                    if is_sep:
-                        pixels[(y * width + x) * 3:(y * width + x) * 3 + 3] = b"\xff\xff\xff"
-                    else:
-                        pixels[(y * width + x) * 3:(y * width + x) * 3 + 3] = bytes((r, g, b))
+            if is_tab:
+                is_active = (ci == active_tab)
+                # Inset tab cell by tab_gap/2 on each side
+                tx0 = x0 + tab_gap // 2
+                tx1 = x1 - tab_gap // 2
+                tw = tx1 - tx0
+                th = y1 - y0
 
-            # Render label centered in cell
+                # Derive 3D bevel colors
+                if is_active:
+                    # Pressed: shadow top/left, highlight bottom/right
+                    sr, sg, sb = max(r - 40, 0), max(g - 40, 0), max(b - 40, 0)
+                    hr, hg, hb = min(r + 40, 255), min(g + 40, 255), min(b + 40, 255)
+                else:
+                    # Released: highlight top/left, shadow bottom/right
+                    hr, hg, hb = min(r + 45, 255), min(g + 45, 255), min(b + 45, 255)
+                    sr, sg, sb = max(r - 45, 0), max(g - 45, 0), max(b - 45, 0)
+
+                for y in range(y0, y1):
+                    for x in range(tx0, tx1):
+                        lx = x - tx0
+                        ly = y - y0
+
+                        # Rounded top corners
+                        in_corner = False
+                        if lx < corner_r and ly < corner_r:
+                            dx, dy = corner_r - lx, corner_r - ly
+                            if dx * dx + dy * dy > corner_r * corner_r:
+                                in_corner = True
+                        elif lx > tw - corner_r - 1 and ly < corner_r:
+                            dx, dy = lx - (tw - corner_r - 1), corner_r - ly
+                            if dx * dx + dy * dy > corner_r * corner_r:
+                                in_corner = True
+
+                        if in_corner:
+                            continue  # Leave as strip background
+
+                        # 3D bevel effect
+                        dt = ly             # distance from top
+                        dl = lx             # distance from left
+                        db = th - 1 - ly    # distance from bottom
+                        dr = tw - 1 - lx    # distance from right
+
+                        if is_active:
+                            if dt < bevel:
+                                color = (sr, sg, sb)
+                            elif dl < bevel:
+                                color = (sr, sg, sb)
+                            elif db < bevel:
+                                color = (hr, hg, hb)
+                            elif dr < bevel:
+                                color = (hr, hg, hb)
+                            else:
+                                color = (r, g, b)
+                        else:
+                            if dt < bevel:
+                                color = (hr, hg, hb)
+                            elif dl < bevel:
+                                color = (hr, hg, hb)
+                            elif db < bevel:
+                                color = (sr, sg, sb)
+                            elif dr < bevel:
+                                color = (sr, sg, sb)
+                            else:
+                                color = (r, g, b)
+
+                        off = (y * width + x) * 3
+                        pixels[off:off + 3] = bytes(color)
+
+                # Label centered within tab bounds
+                lx0, lx1 = tx0, tx1
+            else:
+                # Standard block rendering
+                for y in range(y0, y1):
+                    for x in range(x0, x1):
+                        # Skip top separator if previous row is the tab row
+                        is_sep = (
+                            (x < x0 + gap // 2 and ci > 0)
+                            or (y < y0 + gap // 2 and ri > 0 and ri - 1 != tab_row)
+                        )
+                        if is_sep:
+                            pixels[(y * width + x) * 3:(y * width + x) * 3 + 3] = b"\xff\xff\xff"
+                        else:
+                            pixels[(y * width + x) * 3:(y * width + x) * 3 + 3] = bytes((r, g, b))
+                lx0, lx1 = x0, x1
+
+            # Render label centered in cell (or tab)
             char_w = 5 * scale + scale
             text_w = len(label) * char_w - scale
             text_h = 7 * scale
-            tx = x0 + (x1 - x0 - text_w) // 2
+            tx = lx0 + (lx1 - lx0 - text_w) // 2
             ty = y0 + (y1 - y0 - text_h) // 2
 
             for chi, ch in enumerate(label):
@@ -341,10 +448,10 @@ class LineChannel(BaseChannel):
         self._storage = storage
         self._max_files = max_files_per_session
         self._access = access
-        self._rich_menu_admin: str | None = None
-        self._rich_menu_normal: str | None = None
-        self._rich_menu_admin_queued: str | None = None
-        self._rich_menu_normal_queued: str | None = None
+        self._rich_menu_chat_admin: str | None = None
+        self._rich_menu_chat_normal: str | None = None
+        self._rich_menu_system_admin: str | None = None
+        self._rich_menu_system_normal: str | None = None
         # reply_token cache: chat_id -> (token, received_time)
         self._reply_tokens: dict[str, tuple[str, float]] = {}
         # Per-chat message queue for 429 rate-limit fallback
@@ -433,8 +540,8 @@ class LineChannel(BaseChannel):
                 flex_msg = _flex_tool_status(msg.content) or _flex_help(msg.content)
 
         # Switch Rich Menu when user authenticates as admin
-        if msg.metadata.get("_admin_auth") and self._rich_menu_admin:
-            asyncio.create_task(self._link_rich_menu(msg.chat_id, self._rich_menu_admin))
+        if msg.metadata.get("_admin_auth") and self._rich_menu_chat_admin:
+            asyncio.create_task(self._link_rich_menu(msg.chat_id, self._rich_menu_chat_admin))
 
         if flex_msg:
             messages.append(flex_msg)
@@ -605,6 +712,7 @@ class LineChannel(BaseChannel):
             "consolidate": "/consolidate",
             "cleanup": "/cleanup",
             "new": "/new",
+            "stop": "/stop",
             "admin_panel": "/admin panel",
         }
         params = dict(p.split("=", 1) for p in data.split("&") if "=" in p)
@@ -659,187 +767,224 @@ class LineChannel(BaseChannel):
         )
 
     async def _setup_rich_menus(self) -> None:
-        """Create admin and normal Rich Menus via LINE API."""
+        """Create tabbed Rich Menus (Chat / System) for admin and normal users.
+
+        Layout uses richmenuswitch to toggle between two tabs:
+        - Chat tab:   New | Stop | Continue | Tool (admin) or New | Stop | Continue (normal)
+        - System tab: Consolidate | Cleanup | Admin (admin) or Consolidate | Cleanup (normal)
+        """
         if not self._http:
             return
         try:
-            # Delete existing rich menus to avoid accumulation
+            # ── Clean up old aliases ─────────────────────────────
+            for alias_id in (
+                "nanobot-chat-admin", "nanobot-chat-normal",
+                "nanobot-system-admin", "nanobot-system-normal",
+            ):
+                await self._http.delete(
+                    f"{LINE_API_BASE}/richmenu/alias/{alias_id}",
+                    headers=self._auth_headers,
+                )
+
+            # ── Clean up old menus ───────────────────────────────
             resp = await self._http.get(
                 f"{LINE_API_BASE}/richmenu/list",
                 headers=self._auth_headers,
             )
             if resp.status_code == 200:
+                old_names = {
+                    "nanobot_admin", "nanobot_normal",
+                    "nanobot_admin_q", "nanobot_normal_q",
+                    "nanobot_chat_admin", "nanobot_chat_normal",
+                    "nanobot_system_admin", "nanobot_system_normal",
+                }
                 for rm in resp.json().get("richmenus", []):
-                    name = rm.get("name", "")
-                    if name in ("nanobot_admin", "nanobot_normal", "nanobot_admin_q", "nanobot_normal_q"):
+                    if rm.get("name", "") in old_names:
                         await self._http.delete(
                             f"{LINE_API_BASE}/richmenu/{rm['richMenuId']}",
                             headers=self._auth_headers,
                         )
 
-            # Admin Rich Menu: 2x3 grid (2500x1686)
-            # Row 1: Admin | Tool Mode | New Chat
-            # Row 2: Consolidate | Cleanup | Help
-            hw = 833   # cell width (2500/3)
-            hh = 843   # cell height (1686/2)
-            admin_menu = {
-                "size": {"width": 2500, "height": 1686},
-                "selected": True,
-                "name": "nanobot_admin",
-                "chatBarText": "Menu",
-                "areas": [
-                    {"bounds": {"x": 0, "y": 0, "width": hw, "height": hh},
-                     "action": {"type": "postback", "label": "Admin", "data": "action=admin_panel",
-                                "displayText": "/admin panel"}},
-                    {"bounds": {"x": hw, "y": 0, "width": hw + 1, "height": hh},
-                     "action": {"type": "postback", "label": "Tool Mode", "data": "action=tool",
-                                "displayText": "/tool"}},
-                    {"bounds": {"x": hw * 2, "y": 0, "width": hw + 1, "height": hh},
-                     "action": {"type": "postback", "label": "New Chat", "data": "action=new",
-                                "displayText": "/new"}},
-                    {"bounds": {"x": 0, "y": hh, "width": hw, "height": hh},
-                     "action": {"type": "postback", "label": "Consolidate", "data": "action=consolidate",
-                                "displayText": "/consolidate"}},
-                    {"bounds": {"x": hw, "y": hh, "width": hw + 1, "height": hh},
-                     "action": {"type": "postback", "label": "Cleanup", "data": "action=cleanup",
-                                "displayText": "/cleanup"}},
-                    {"bounds": {"x": hw * 2, "y": hh, "width": hw + 1, "height": hh},
-                     "action": {"type": "message", "label": "Help", "text": "/help"}},
-                ],
-            }
-            resp = await self._http.post(
-                f"{LINE_API_BASE}/richmenu",
-                headers=self._auth_headers,
-                json=admin_menu,
-            )
-            if resp.status_code == 200:
-                self._rich_menu_admin = resp.json().get("richMenuId")
-                await self._upload_rich_menu_image(self._rich_menu_admin, [
-                    [("Admin", (30, 120, 70)), ("Tool Mode", (50, 90, 160)), ("New Chat", (80, 80, 90))],
-                    [("Consolidate", (120, 90, 40)), ("Cleanup", (140, 60, 60)), ("Help", (60, 60, 80))],
-                ])
-                logger.info("Created admin Rich Menu: {}", self._rich_menu_admin)
+            tab_h = 562   # tab row height (1/3 of 1686)
+            btn_h = 1124  # button row height (2/3 of 1686)
+            thw = 1250    # tab cell width (2500 / 2)
+            tab_kw = {"row_heights": [tab_h, btn_h], "tab_row": 0}
 
-            # Normal Rich Menu: 2x2 grid (2500x1686)
-            # Row 1: New Chat | Help
-            # Row 2: Consolidate | Cleanup
-            nhw = 1250  # cell width (2500/2)
-            normal_menu = {
+            # ── Chat Admin: 2 rows ──────────────────────────────
+            # Row 1 (tabs): [Chat *] [System]
+            # Row 2 (actions): [New] [Stop] [Continue] [Tool]
+            cw4 = 625  # cell width for 4 columns
+            chat_admin_menu = {
                 "size": {"width": 2500, "height": 1686},
                 "selected": True,
-                "name": "nanobot_normal",
-                "chatBarText": "Menu",
+                "name": "nanobot_chat_admin",
+                "chatBarText": "Chat",
                 "areas": [
-                    {"bounds": {"x": 0, "y": 0, "width": nhw, "height": hh},
-                     "action": {"type": "postback", "label": "New Chat", "data": "action=new",
+                    # Tab row
+                    {"bounds": {"x": 0, "y": 0, "width": thw, "height": tab_h},
+                     "action": {"type": "postback", "label": "Chat", "data": "tab=chat"}},
+                    {"bounds": {"x": thw, "y": 0, "width": thw, "height": tab_h},
+                     "action": {"type": "richmenuswitch", "richMenuAliasId": "nanobot-system-admin",
+                                "data": "tab=system"}},
+                    # Action row
+                    {"bounds": {"x": 0, "y": tab_h, "width": cw4, "height": btn_h},
+                     "action": {"type": "postback", "label": "New", "data": "action=new",
                                 "displayText": "/new"}},
-                    {"bounds": {"x": nhw, "y": 0, "width": nhw, "height": hh},
-                     "action": {"type": "message", "label": "Help", "text": "/help"}},
-                    {"bounds": {"x": 0, "y": hh, "width": nhw, "height": hh},
-                     "action": {"type": "postback", "label": "Consolidate", "data": "action=consolidate",
-                                "displayText": "/consolidate"}},
-                    {"bounds": {"x": nhw, "y": hh, "width": nhw, "height": hh},
-                     "action": {"type": "postback", "label": "Cleanup", "data": "action=cleanup",
-                                "displayText": "/cleanup"}},
+                    {"bounds": {"x": cw4, "y": tab_h, "width": cw4, "height": btn_h},
+                     "action": {"type": "postback", "label": "Stop", "data": "action=stop",
+                                "displayText": "/stop"}},
+                    {"bounds": {"x": cw4 * 2, "y": tab_h, "width": cw4, "height": btn_h},
+                     "action": {"type": "postback", "label": "Continue", "data": "action=continue",
+                                "displayText": "."}},
+                    {"bounds": {"x": cw4 * 3, "y": tab_h, "width": cw4, "height": btn_h},
+                     "action": {"type": "postback", "label": "Tool", "data": "action=tool",
+                                "displayText": "/tool"}},
                 ],
             }
             resp = await self._http.post(
-                f"{LINE_API_BASE}/richmenu",
-                headers=self._auth_headers,
-                json=normal_menu,
+                f"{LINE_API_BASE}/richmenu", headers=self._auth_headers, json=chat_admin_menu,
             )
             if resp.status_code == 200:
-                self._rich_menu_normal = resp.json().get("richMenuId")
-                await self._upload_rich_menu_image(self._rich_menu_normal, [
-                    [("New Chat", (50, 90, 160)), ("Help", (60, 60, 80))],
-                    [("Consolidate", (120, 90, 40)), ("Cleanup", (140, 60, 60))],
-                ])
+                self._rich_menu_chat_admin = resp.json().get("richMenuId")
+                await self._upload_rich_menu_image(self._rich_menu_chat_admin, [
+                    [("Chat", (40, 100, 160)), ("System", (60, 60, 70))],
+                    [("New", (50, 130, 80)), ("Stop", (180, 50, 50)),
+                     ("Continue", (0, 120, 60)), ("Tool", (50, 90, 160))],
+                ], **tab_kw, active_tab=0)
+                logger.info("Created chat admin Rich Menu: {}", self._rich_menu_chat_admin)
+
+            # ── Chat Normal: 2 rows ─────────────────────────────
+            # Row 1 (tabs): [Chat *] [System]
+            # Row 2 (actions): [New] [Stop] [Continue]
+            cw3 = 833  # cell width for 3 columns
+            chat_normal_menu = {
+                "size": {"width": 2500, "height": 1686},
+                "selected": True,
+                "name": "nanobot_chat_normal",
+                "chatBarText": "Chat",
+                "areas": [
+                    {"bounds": {"x": 0, "y": 0, "width": thw, "height": tab_h},
+                     "action": {"type": "postback", "label": "Chat", "data": "tab=chat"}},
+                    {"bounds": {"x": thw, "y": 0, "width": thw, "height": tab_h},
+                     "action": {"type": "richmenuswitch", "richMenuAliasId": "nanobot-system-normal",
+                                "data": "tab=system"}},
+                    {"bounds": {"x": 0, "y": tab_h, "width": cw3, "height": btn_h},
+                     "action": {"type": "postback", "label": "New", "data": "action=new",
+                                "displayText": "/new"}},
+                    {"bounds": {"x": cw3, "y": tab_h, "width": cw3 + 1, "height": btn_h},
+                     "action": {"type": "postback", "label": "Stop", "data": "action=stop",
+                                "displayText": "/stop"}},
+                    {"bounds": {"x": cw3 * 2, "y": tab_h, "width": cw3 + 1, "height": btn_h},
+                     "action": {"type": "postback", "label": "Continue", "data": "action=continue",
+                                "displayText": "."}},
+                ],
+            }
+            resp = await self._http.post(
+                f"{LINE_API_BASE}/richmenu", headers=self._auth_headers, json=chat_normal_menu,
+            )
+            if resp.status_code == 200:
+                self._rich_menu_chat_normal = resp.json().get("richMenuId")
+                await self._upload_rich_menu_image(self._rich_menu_chat_normal, [
+                    [("Chat", (40, 100, 160)), ("System", (60, 60, 70))],
+                    [("New", (50, 130, 80)), ("Stop", (180, 50, 50)), ("Continue", (0, 120, 60))],
+                ], **tab_kw, active_tab=0)
                 # Set as default for all users
                 await self._http.post(
-                    f"{LINE_API_BASE}/user/all/richmenu/{self._rich_menu_normal}",
+                    f"{LINE_API_BASE}/user/all/richmenu/{self._rich_menu_chat_normal}",
                     headers=self._auth_headers,
                 )
-                logger.info("Created normal Rich Menu (default): {}", self._rich_menu_normal)
+                logger.info("Created chat normal Rich Menu (default): {}", self._rich_menu_chat_normal)
 
-            # ── Queued variants (with Continue button) ──────────────
-            # Admin queued: same as admin but Help → Continue
-            admin_queued_menu = {
+            # ── System Admin: 2 rows ────────────────────────────
+            # Row 1 (tabs): [Chat] [System *]
+            # Row 2 (actions): [Consolidate] [Cleanup] [Admin]
+            system_admin_menu = {
                 "size": {"width": 2500, "height": 1686},
                 "selected": True,
-                "name": "nanobot_admin_q",
-                "chatBarText": "Menu",
+                "name": "nanobot_system_admin",
+                "chatBarText": "System",
                 "areas": [
-                    {"bounds": {"x": 0, "y": 0, "width": hw, "height": hh},
-                     "action": {"type": "postback", "label": "Admin", "data": "action=admin_panel",
-                                "displayText": "/admin panel"}},
-                    {"bounds": {"x": hw, "y": 0, "width": hw + 1, "height": hh},
-                     "action": {"type": "postback", "label": "Tool Mode", "data": "action=tool",
-                                "displayText": "/tool"}},
-                    {"bounds": {"x": hw * 2, "y": 0, "width": hw + 1, "height": hh},
-                     "action": {"type": "postback", "label": "New Chat", "data": "action=new",
-                                "displayText": "/new"}},
-                    {"bounds": {"x": 0, "y": hh, "width": hw, "height": hh},
+                    {"bounds": {"x": 0, "y": 0, "width": thw, "height": tab_h},
+                     "action": {"type": "richmenuswitch", "richMenuAliasId": "nanobot-chat-admin",
+                                "data": "tab=chat"}},
+                    {"bounds": {"x": thw, "y": 0, "width": thw, "height": tab_h},
+                     "action": {"type": "postback", "label": "System", "data": "tab=system"}},
+                    {"bounds": {"x": 0, "y": tab_h, "width": cw3, "height": btn_h},
                      "action": {"type": "postback", "label": "Consolidate", "data": "action=consolidate",
                                 "displayText": "/consolidate"}},
-                    {"bounds": {"x": hw, "y": hh, "width": hw + 1, "height": hh},
+                    {"bounds": {"x": cw3, "y": tab_h, "width": cw3 + 1, "height": btn_h},
                      "action": {"type": "postback", "label": "Cleanup", "data": "action=cleanup",
                                 "displayText": "/cleanup"}},
-                    {"bounds": {"x": hw * 2, "y": hh, "width": hw + 1, "height": hh},
-                     "action": {"type": "postback", "label": "Continue", "data": "action=continue",
-                                "displayText": "."}},
+                    {"bounds": {"x": cw3 * 2, "y": tab_h, "width": cw3 + 1, "height": btn_h},
+                     "action": {"type": "postback", "label": "Admin", "data": "action=admin_panel",
+                                "displayText": "/admin panel"}},
                 ],
             }
             resp = await self._http.post(
-                f"{LINE_API_BASE}/richmenu",
-                headers=self._auth_headers,
-                json=admin_queued_menu,
+                f"{LINE_API_BASE}/richmenu", headers=self._auth_headers, json=system_admin_menu,
             )
             if resp.status_code == 200:
-                self._rich_menu_admin_queued = resp.json().get("richMenuId")
-                await self._upload_rich_menu_image(self._rich_menu_admin_queued, [
-                    [("Admin", (30, 120, 70)), ("Tool Mode", (50, 90, 160)), ("New Chat", (80, 80, 90))],
-                    [("Consolidate", (120, 90, 40)), ("Cleanup", (140, 60, 60)), ("Continue", (0, 120, 60))],
-                ])
-                logger.info("Created admin queued Rich Menu: {}", self._rich_menu_admin_queued)
+                self._rich_menu_system_admin = resp.json().get("richMenuId")
+                await self._upload_rich_menu_image(self._rich_menu_system_admin, [
+                    [("Chat", (60, 60, 70)), ("System", (40, 100, 160))],
+                    [("Consolidate", (120, 90, 40)), ("Cleanup", (140, 60, 60)), ("Admin", (30, 120, 70))],
+                ], **tab_kw, active_tab=1)
+                logger.info("Created system admin Rich Menu: {}", self._rich_menu_system_admin)
 
-            # Normal queued: same as normal but Cleanup → Continue
-            normal_queued_menu = {
+            # ── System Normal: 2 rows ───────────────────────────
+            # Row 1 (tabs): [Chat] [System *]
+            # Row 2 (actions): [Consolidate] [Cleanup]
+            nhw = 1250  # cell width for 2 columns
+            system_normal_menu = {
                 "size": {"width": 2500, "height": 1686},
                 "selected": True,
-                "name": "nanobot_normal_q",
-                "chatBarText": "Menu",
+                "name": "nanobot_system_normal",
+                "chatBarText": "System",
                 "areas": [
-                    {"bounds": {"x": 0, "y": 0, "width": nhw, "height": hh},
-                     "action": {"type": "postback", "label": "New Chat", "data": "action=new",
-                                "displayText": "/new"}},
-                    {"bounds": {"x": nhw, "y": 0, "width": nhw, "height": hh},
-                     "action": {"type": "message", "label": "Help", "text": "/help"}},
-                    {"bounds": {"x": 0, "y": hh, "width": nhw, "height": hh},
+                    {"bounds": {"x": 0, "y": 0, "width": thw, "height": tab_h},
+                     "action": {"type": "richmenuswitch", "richMenuAliasId": "nanobot-chat-normal",
+                                "data": "tab=chat"}},
+                    {"bounds": {"x": thw, "y": 0, "width": thw, "height": tab_h},
+                     "action": {"type": "postback", "label": "System", "data": "tab=system"}},
+                    {"bounds": {"x": 0, "y": tab_h, "width": nhw, "height": btn_h},
                      "action": {"type": "postback", "label": "Consolidate", "data": "action=consolidate",
                                 "displayText": "/consolidate"}},
-                    {"bounds": {"x": nhw, "y": hh, "width": nhw, "height": hh},
-                     "action": {"type": "postback", "label": "Continue", "data": "action=continue",
-                                "displayText": "."}},
+                    {"bounds": {"x": nhw, "y": tab_h, "width": nhw, "height": btn_h},
+                     "action": {"type": "postback", "label": "Cleanup", "data": "action=cleanup",
+                                "displayText": "/cleanup"}},
                 ],
             }
             resp = await self._http.post(
-                f"{LINE_API_BASE}/richmenu",
-                headers=self._auth_headers,
-                json=normal_queued_menu,
+                f"{LINE_API_BASE}/richmenu", headers=self._auth_headers, json=system_normal_menu,
             )
             if resp.status_code == 200:
-                self._rich_menu_normal_queued = resp.json().get("richMenuId")
-                await self._upload_rich_menu_image(self._rich_menu_normal_queued, [
-                    [("New Chat", (50, 90, 160)), ("Help", (60, 60, 80))],
-                    [("Consolidate", (120, 90, 40)), ("Continue", (0, 120, 60))],
-                ])
-                logger.info("Created normal queued Rich Menu: {}", self._rich_menu_normal_queued)
+                self._rich_menu_system_normal = resp.json().get("richMenuId")
+                await self._upload_rich_menu_image(self._rich_menu_system_normal, [
+                    [("Chat", (60, 60, 70)), ("System", (40, 100, 160))],
+                    [("Consolidate", (120, 90, 40)), ("Cleanup", (140, 60, 60))],
+                ], **tab_kw, active_tab=1)
+                logger.info("Created system normal Rich Menu: {}", self._rich_menu_system_normal)
+
+            # ── Create aliases for richmenuswitch ────────────────
+            alias_map = {
+                "nanobot-chat-admin": self._rich_menu_chat_admin,
+                "nanobot-chat-normal": self._rich_menu_chat_normal,
+                "nanobot-system-admin": self._rich_menu_system_admin,
+                "nanobot-system-normal": self._rich_menu_system_normal,
+            }
+            for alias_id, menu_id in alias_map.items():
+                if menu_id:
+                    await self._http.post(
+                        f"{LINE_API_BASE}/richmenu/alias",
+                        headers=self._auth_headers,
+                        json={"richMenuAliasId": alias_id, "richMenuId": menu_id},
+                    )
 
             # Re-link admin menu to known admin users
-            if self._rich_menu_admin and self._access:
+            if self._rich_menu_chat_admin and self._access:
                 admins = self._access._data.get("admins", [])
                 for uid in admins:
-                    await self._link_rich_menu(uid, self._rich_menu_admin)
+                    await self._link_rich_menu(uid, self._rich_menu_chat_admin)
                 if admins:
                     logger.info("Re-linked admin Rich Menu for {} user(s)", len(admins))
 
@@ -848,18 +993,31 @@ class LineChannel(BaseChannel):
 
     async def _upload_rich_menu_image(
         self, menu_id: str, rows: list[list[tuple[str, tuple[int, int, int]]]],
+        *,
+        row_heights: list[int] | None = None,
+        tab_row: int | None = None,
+        active_tab: int | None = None,
     ) -> None:
         """Upload a PNG image with labeled colored cells for a Rich Menu.
 
         Args:
             menu_id: Rich Menu ID to upload to.
             rows: List of rows, each row is a list of (label, (r, g, b)) cells.
+            row_heights: Optional pixel heights per row. If None, 843px per row.
+            tab_row: Index of the row to render as tabs.
+            active_tab: Index of the active (pressed) tab cell.
         """
         if not self._http or not menu_id:
             return
         try:
-            img_height = 843 * len(rows)
-            png = _render_rich_menu_png(2500, img_height, rows)
+            if row_heights:
+                img_height = sum(row_heights)
+            else:
+                img_height = 843 * len(rows)
+            png = _render_rich_menu_png(
+                2500, img_height, rows,
+                row_heights=row_heights, tab_row=tab_row, active_tab=active_tab,
+            )
             resp = await self._http.post(
                 f"{LINE_DATA_API}/richmenu/{menu_id}/content",
                 headers={
@@ -1038,12 +1196,9 @@ class LineChannel(BaseChannel):
 
     def _queue_messages(self, chat_id: str, messages: list[dict[str, Any]]) -> None:
         """Add messages to the pending queue and show Continue rich menu."""
-        had_queue = bool(self._pending_queues.get(chat_id))
         self._pending_queues.setdefault(chat_id, []).extend(messages)
         logger.info("LINE queued {} message(s) for {} (total: {})",
                      len(messages), chat_id, len(self._pending_queues[chat_id]))
-        if not had_queue:
-            asyncio.create_task(self._swap_to_queued_menu(chat_id))
 
     async def _flush_queue(self, chat_id: str, reply_token: str | None = None) -> bool:
         """Flush queued messages for a chat using the reply API (free).
@@ -1063,23 +1218,11 @@ class LineChannel(BaseChannel):
 
         if not queue:
             del self._pending_queues[chat_id]
-            asyncio.create_task(self._swap_to_normal_menu(chat_id))
         else:
             logger.info("LINE queue for {}: {} message(s) remaining", chat_id, len(queue))
 
         return True
 
-    async def _swap_to_queued_menu(self, chat_id: str) -> None:
-        """Switch user to the rich menu with Continue button."""
-        menu = self._rich_menu_admin_queued if self._is_admin(chat_id) else self._rich_menu_normal_queued
-        if menu:
-            await self._link_rich_menu(chat_id, menu)
-
-    async def _swap_to_normal_menu(self, chat_id: str) -> None:
-        """Switch user back to the normal rich menu."""
-        menu = self._rich_menu_admin if self._is_admin(chat_id) else self._rich_menu_normal
-        if menu:
-            await self._link_rich_menu(chat_id, menu)
 
     def _is_admin(self, chat_id: str) -> bool:
         """Check if a user is admin via access manager."""
