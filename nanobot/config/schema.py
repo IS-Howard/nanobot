@@ -131,6 +131,7 @@ class ExecToolConfig(Base):
 
     timeout: int = 60
     path_append: str = ""
+    python_via_uv: bool = True  # Rewrite bare `python`/`pip` to `uv run python`/`uv pip`
 
 
 class MCPServerConfig(Base):
