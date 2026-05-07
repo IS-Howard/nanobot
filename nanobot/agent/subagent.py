@@ -11,7 +11,7 @@ from loguru import logger
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
-from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.tools.web import WebBrowseTool, WebFetchTool, WebSearchTool, _DevBrowserRunner
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import ExecToolConfig
@@ -107,7 +107,9 @@ class SubagentManager:
                 path_append=self.exec_config.path_append,
             ))
             tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
-            tools.register(WebFetchTool(proxy=self.web_proxy))
+            browser_runner = _DevBrowserRunner()
+            tools.register(WebFetchTool(runner=browser_runner))
+            tools.register(WebBrowseTool(runner=browser_runner, workspace=self.workspace))
             
             system_prompt = self._build_subagent_prompt()
             messages: list[dict[str, Any]] = [

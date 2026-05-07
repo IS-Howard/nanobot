@@ -115,6 +115,15 @@ uv tool install nanobot-ai
 pip install nanobot-ai
 ```
 
+**Optional: install dev-browser** (powers `web_fetch` / `web_browse` — real Chromium for JS-rendered pages and modern TLS)
+
+```bash
+npm i -g dev-browser
+dev-browser install   # downloads Playwright + Chromium
+```
+
+If `dev-browser` is missing, `web_search` (Brave) still works; only the fetch/browse tools are disabled.
+
 ## 🚀 Quick Start
 
 > [!TIP]
