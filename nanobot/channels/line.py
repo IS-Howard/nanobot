@@ -35,6 +35,10 @@ LINE_DATA_API = "https://api-data.line.me/v2/bot"
 LINE_MAX_TEXT = 5000
 LINE_MAX_MESSAGES_PER_PUSH = 5
 LINE_REPLY_TOKEN_TTL = 20  # seconds; LINE tokens expire at ~30s, use 20s for safety
+# Push a "Processing…" stub once the reply token is about to expire (2s before
+# our cached TTL). Earlier values produce noise stubs for moderately-slow
+# replies that would have arrived in time anyway.
+LINE_PROCESSING_STUB_DELAY = LINE_REPLY_TOKEN_TTL - 2
 
 # msg_type -> (mime_type, extension)
 _MIME_MAP: dict[str, tuple[str, str]] = {
@@ -475,16 +479,16 @@ class LineChannel(BaseChannel):
         self._storage = storage
         self._max_files = max_files_per_session
         self._access = access
-        self._rich_menu_chat_admin: str | None = None
-        self._rich_menu_chat_normal: str | None = None
-        self._rich_menu_system_admin: str | None = None
-        self._rich_menu_system_normal: str | None = None
+        self._rich_menu_admin: str | None = None
+        self._rich_menu_normal: str | None = None
         # reply_token cache: chat_id -> (token, received_time)
         self._reply_tokens: dict[str, tuple[str, float]] = {}
         # Per-chat message queue for 429 rate-limit fallback
         self._pending_queues: dict[str, list[dict[str, Any]]] = {}
         # Loading animation keep-alive tasks per chat
         self._loading_tasks: dict[str, asyncio.Task[None]] = {}
+        # Per-chat "processing..." stub task (fires if agent stays silent past LINE_PROCESSING_STUB_DELAY)
+        self._stub_tasks: dict[str, asyncio.Task[None]] = {}
         # Track latest source_type per chat ("user" | "group" | "room") for quick-reply gating
         self._chat_source_types: dict[str, str] = {}
 
@@ -550,6 +554,9 @@ class LineChannel(BaseChannel):
             logger.warning("LINE client not running")
             return
 
+        # Any outbound message means the agent is no longer silent — drop the stub.
+        self._cancel_processing_stub(msg.chat_id)
+
         is_progress = msg.metadata.get("_progress", False)
         if not is_progress:
             self._cancel_loading(msg.chat_id)
@@ -571,8 +578,8 @@ class LineChannel(BaseChannel):
                 flex_msg = _flex_tool_status(msg.content) or _flex_help(msg.content)
 
         # Switch Rich Menu when user authenticates as admin
-        if msg.metadata.get("_admin_auth") and self._rich_menu_chat_admin:
-            asyncio.create_task(self._link_rich_menu(msg.chat_id, self._rich_menu_chat_admin))
+        if msg.metadata.get("_admin_auth") and self._rich_menu_admin:
+            asyncio.create_task(self._link_rich_menu(msg.chat_id, self._rich_menu_admin))
 
         if flex_msg:
             messages.append(flex_msg)
@@ -598,22 +605,11 @@ class LineChannel(BaseChannel):
                 "previewImageUrl": media_url,
             })
 
-        # Attach quick-reply buttons to the LAST text message (1:1 by default).
-        # Skip when this is a Flex/special-mode response or a streaming progress chunk.
-        is_special = bool(
-            msg.metadata.get("_admin_panel")
-            or msg.metadata.get("_transcribe_confirm")
-        )
-        if (
-            not is_progress
-            and not flex_msg
-            and not is_special
-            and self._should_attach_quick_reply(msg.chat_id)
-        ):
-            for m in reversed(messages):
-                if m.get("type") == "text":
-                    self._attach_quick_reply(m)
-                    break
+        # Attach context-aware quick-reply buttons to the last user-visible
+        # message of this batch (text or flex). Stop appears only while busy;
+        # Continue when a queue is present or the reply token is near expiry.
+        if self._should_attach_quick_reply(msg.chat_id):
+            self._attach_quick_reply(messages, msg.chat_id, is_progress)
 
         if not messages:
             return
@@ -744,6 +740,7 @@ class LineChannel(BaseChannel):
 
         if reply_token:
             self._reply_tokens[chat_id] = (reply_token, time.monotonic())
+            self._schedule_processing_stub(chat_id)
 
         logger.debug(
             "LINE message: type={} sender={} chat={} text={}",
@@ -775,6 +772,7 @@ class LineChannel(BaseChannel):
             "attach": "/a",
             "transcribe": "/transcribe",
             "admin_panel": "/admin panel",
+            "help": "/help",
         }
         params = dict(p.split("=", 1) for p in data.split("&") if "=" in p)
         action = params.get("action", "")
@@ -833,16 +831,22 @@ class LineChannel(BaseChannel):
         )
 
     async def _setup_rich_menus(self) -> None:
-        """Create tabbed Rich Menus (Chat / System) for admin and normal users.
+        """Create compact single-row Rich Menus for admin and normal users.
 
-        Layout uses richmenuswitch to toggle between two tabs:
-        - Chat tab:   New | Stop | Continue | Tool (admin) or New | Stop | Continue (normal)
-        - System tab: Consolidate | Cleanup | Admin (admin) or Consolidate | Cleanup (normal)
+        The rich menu now hosts only rare/system actions plus an always-visible
+        Stop button (the kill-switch users reach for when the bot is stuck or
+        a reply is mid-flight before any quick-reply has rendered):
+
+        - Admin:  [Stop | Consolidate | Cleanup | Admin]
+        - Normal: [Stop | Consolidate | Cleanup]
+
+        Frequent chat actions (New, Tool, Attach, Help) and the contextual
+        Continue button live on quick-reply attached to outbound messages.
         """
         if not self._http:
             return
         try:
-            # ── Clean up old aliases ─────────────────────────────
+            # ── Clean up old aliases (from the previous tabbed layout) ───
             for alias_id in (
                 "nanobot-chat-admin", "nanobot-chat-normal",
                 "nanobot-system-admin", "nanobot-system-normal",
@@ -871,194 +875,77 @@ class LineChannel(BaseChannel):
                             headers=self._auth_headers,
                         )
 
-            tab_h = 562   # tab row height (1/3 of 1686)
-            btn_h = 1124  # button row height (2/3 of 1686)
-            thw = 1250    # tab cell width (2500 / 2)
-            tab_kw = {"row_heights": [tab_h, btn_h], "tab_row": 0}
+            # Compact LINE rich-menu canvas (2500x843 = half-height).
+            menu_h = 843
 
-            # ── Chat Admin: 2 rows ──────────────────────────────
-            # Row 1 (tabs): [Chat *] [System]
-            # Row 2 (actions): [New] [Stop] [Attach] [Continue] [Tool]
-            cw5 = 500  # cell width for 5 columns
-            chat_admin_menu = {
-                "size": {"width": 2500, "height": 1686},
+            # ── Admin: [Stop | Consolidate | Cleanup | Admin] ────
+            cw4 = 625  # 2500 / 4
+            admin_menu = {
+                "size": {"width": 2500, "height": menu_h},
                 "selected": True,
-                "name": "nanobot_chat_admin",
-                "chatBarText": "Chat",
+                "name": "nanobot_admin",
+                "chatBarText": "Menu",
                 "areas": [
-                    # Tab row
-                    {"bounds": {"x": 0, "y": 0, "width": thw, "height": tab_h},
-                     "action": {"type": "postback", "label": "Chat", "data": "tab=chat"}},
-                    {"bounds": {"x": thw, "y": 0, "width": thw, "height": tab_h},
-                     "action": {"type": "richmenuswitch", "richMenuAliasId": "nanobot-system-admin",
-                                "data": "tab=system"}},
-                    # Action row
-                    {"bounds": {"x": 0, "y": tab_h, "width": cw5, "height": btn_h},
-                     "action": {"type": "postback", "label": "New", "data": "action=new",
-                                "displayText": "/new"}},
-                    {"bounds": {"x": cw5, "y": tab_h, "width": cw5, "height": btn_h},
-                     "action": {"type": "postback", "label": "Stop", "data": "action=stop",
-                                "displayText": "/stop"}},
-                    {"bounds": {"x": cw5 * 2, "y": tab_h, "width": cw5, "height": btn_h},
-                     "action": {"type": "postback", "label": "Attach", "data": "action=attach",
-                                "displayText": "/a"}},
-                    {"bounds": {"x": cw5 * 3, "y": tab_h, "width": cw5, "height": btn_h},
-                     "action": {"type": "postback", "label": "Continue", "data": "action=continue",
-                                "displayText": "."}},
-                    {"bounds": {"x": cw5 * 4, "y": tab_h, "width": cw5, "height": btn_h},
-                     "action": {"type": "postback", "label": "Tool", "data": "action=tool",
-                                "displayText": "/tool"}},
+                    {"bounds": {"x": 0, "y": 0, "width": cw4, "height": menu_h},
+                     "action": {"type": "postback", "label": "Stop", "data": "action=stop"}},
+                    {"bounds": {"x": cw4, "y": 0, "width": cw4, "height": menu_h},
+                     "action": {"type": "postback", "label": "Consolidate",
+                                "data": "action=consolidate"}},
+                    {"bounds": {"x": cw4 * 2, "y": 0, "width": cw4, "height": menu_h},
+                     "action": {"type": "postback", "label": "Cleanup", "data": "action=cleanup"}},
+                    {"bounds": {"x": cw4 * 3, "y": 0, "width": cw4, "height": menu_h},
+                     "action": {"type": "postback", "label": "Admin", "data": "action=admin_panel"}},
                 ],
             }
             resp = await self._http.post(
-                f"{LINE_API_BASE}/richmenu", headers=self._auth_headers, json=chat_admin_menu,
+                f"{LINE_API_BASE}/richmenu", headers=self._auth_headers, json=admin_menu,
             )
             if resp.status_code == 200:
-                self._rich_menu_chat_admin = resp.json().get("richMenuId")
-                await self._upload_rich_menu_image(self._rich_menu_chat_admin, [
-                    [("Chat", (40, 100, 160)), ("System", (60, 60, 70))],
-                    [("New", (50, 130, 80)), ("Stop", (180, 50, 50)),
-                     ("Attach", (100, 80, 140)), ("Continue", (0, 120, 60)), ("Tool", (50, 90, 160))],
-                ], **tab_kw, active_tab=0)
-                logger.info("Created chat admin Rich Menu: {}", self._rich_menu_chat_admin)
+                self._rich_menu_admin = resp.json().get("richMenuId")
+                await self._upload_rich_menu_image(self._rich_menu_admin, [
+                    [("Stop", (180, 50, 50)), ("Consolidate", (120, 90, 40)),
+                     ("Cleanup", (140, 60, 60)), ("Admin", (30, 120, 70))],
+                ])
+                logger.info("Created admin Rich Menu: {}", self._rich_menu_admin)
 
-            # ── Chat Normal: 2 rows ─────────────────────────────
-            # Row 1 (tabs): [Chat *] [System]
-            # Row 2 (actions): [New] [Stop] [Attach] [Continue]
-            cw4 = 625  # cell width for 4 columns
-            chat_normal_menu = {
-                "size": {"width": 2500, "height": 1686},
+            # ── Normal: [Stop | Consolidate | Cleanup] ───────────
+            cw3 = 833  # 2500 / 3 (rounded down)
+            normal_menu = {
+                "size": {"width": 2500, "height": menu_h},
                 "selected": True,
-                "name": "nanobot_chat_normal",
-                "chatBarText": "Chat",
+                "name": "nanobot_normal",
+                "chatBarText": "Menu",
                 "areas": [
-                    {"bounds": {"x": 0, "y": 0, "width": thw, "height": tab_h},
-                     "action": {"type": "postback", "label": "Chat", "data": "tab=chat"}},
-                    {"bounds": {"x": thw, "y": 0, "width": thw, "height": tab_h},
-                     "action": {"type": "richmenuswitch", "richMenuAliasId": "nanobot-system-normal",
-                                "data": "tab=system"}},
-                    {"bounds": {"x": 0, "y": tab_h, "width": cw4, "height": btn_h},
-                     "action": {"type": "postback", "label": "New", "data": "action=new",
-                                "displayText": "/new"}},
-                    {"bounds": {"x": cw4, "y": tab_h, "width": cw4, "height": btn_h},
-                     "action": {"type": "postback", "label": "Stop", "data": "action=stop",
-                                "displayText": "/stop"}},
-                    {"bounds": {"x": cw4 * 2, "y": tab_h, "width": cw4, "height": btn_h},
-                     "action": {"type": "postback", "label": "Attach", "data": "action=attach",
-                                "displayText": "/a"}},
-                    {"bounds": {"x": cw4 * 3, "y": tab_h, "width": cw4, "height": btn_h},
-                     "action": {"type": "postback", "label": "Continue", "data": "action=continue",
-                                "displayText": "."}},
+                    {"bounds": {"x": 0, "y": 0, "width": cw3, "height": menu_h},
+                     "action": {"type": "postback", "label": "Stop", "data": "action=stop"}},
+                    {"bounds": {"x": cw3, "y": 0, "width": cw3 + 1, "height": menu_h},
+                     "action": {"type": "postback", "label": "Consolidate",
+                                "data": "action=consolidate"}},
+                    {"bounds": {"x": cw3 * 2, "y": 0, "width": cw3 + 1, "height": menu_h},
+                     "action": {"type": "postback", "label": "Cleanup", "data": "action=cleanup"}},
                 ],
             }
             resp = await self._http.post(
-                f"{LINE_API_BASE}/richmenu", headers=self._auth_headers, json=chat_normal_menu,
+                f"{LINE_API_BASE}/richmenu", headers=self._auth_headers, json=normal_menu,
             )
             if resp.status_code == 200:
-                self._rich_menu_chat_normal = resp.json().get("richMenuId")
-                await self._upload_rich_menu_image(self._rich_menu_chat_normal, [
-                    [("Chat", (40, 100, 160)), ("System", (60, 60, 70))],
-                    [("New", (50, 130, 80)), ("Stop", (180, 50, 50)),
-                     ("Attach", (100, 80, 140)), ("Continue", (0, 120, 60))],
-                ], **tab_kw, active_tab=0)
-                # Set as default for all users
+                self._rich_menu_normal = resp.json().get("richMenuId")
+                await self._upload_rich_menu_image(self._rich_menu_normal, [
+                    [("Stop", (180, 50, 50)), ("Consolidate", (120, 90, 40)),
+                     ("Cleanup", (140, 60, 60))],
+                ])
+                # Set as default for all users.
                 await self._http.post(
-                    f"{LINE_API_BASE}/user/all/richmenu/{self._rich_menu_chat_normal}",
+                    f"{LINE_API_BASE}/user/all/richmenu/{self._rich_menu_normal}",
                     headers=self._auth_headers,
                 )
-                logger.info("Created chat normal Rich Menu (default): {}", self._rich_menu_chat_normal)
+                logger.info("Created normal Rich Menu (default): {}", self._rich_menu_normal)
 
-            # ── System Admin: 2 rows ────────────────────────────
-            # Row 1 (tabs): [Chat] [System *]
-            # Row 2 (actions): [Consolidate] [Cleanup] [Admin]
-            cw3 = 833  # cell width for 3 columns
-            system_admin_menu = {
-                "size": {"width": 2500, "height": 1686},
-                "selected": True,
-                "name": "nanobot_system_admin",
-                "chatBarText": "System",
-                "areas": [
-                    {"bounds": {"x": 0, "y": 0, "width": thw, "height": tab_h},
-                     "action": {"type": "richmenuswitch", "richMenuAliasId": "nanobot-chat-admin",
-                                "data": "tab=chat"}},
-                    {"bounds": {"x": thw, "y": 0, "width": thw, "height": tab_h},
-                     "action": {"type": "postback", "label": "System", "data": "tab=system"}},
-                    {"bounds": {"x": 0, "y": tab_h, "width": cw3, "height": btn_h},
-                     "action": {"type": "postback", "label": "Consolidate", "data": "action=consolidate",
-                                "displayText": "/consolidate"}},
-                    {"bounds": {"x": cw3, "y": tab_h, "width": cw3 + 1, "height": btn_h},
-                     "action": {"type": "postback", "label": "Cleanup", "data": "action=cleanup",
-                                "displayText": "/cleanup"}},
-                    {"bounds": {"x": cw3 * 2, "y": tab_h, "width": cw3 + 1, "height": btn_h},
-                     "action": {"type": "postback", "label": "Admin", "data": "action=admin_panel",
-                                "displayText": "/admin panel"}},
-                ],
-            }
-            resp = await self._http.post(
-                f"{LINE_API_BASE}/richmenu", headers=self._auth_headers, json=system_admin_menu,
-            )
-            if resp.status_code == 200:
-                self._rich_menu_system_admin = resp.json().get("richMenuId")
-                await self._upload_rich_menu_image(self._rich_menu_system_admin, [
-                    [("Chat", (60, 60, 70)), ("System", (40, 100, 160))],
-                    [("Consolidate", (120, 90, 40)), ("Cleanup", (140, 60, 60)), ("Admin", (30, 120, 70))],
-                ], **tab_kw, active_tab=1)
-                logger.info("Created system admin Rich Menu: {}", self._rich_menu_system_admin)
-
-            # ── System Normal: 2 rows ───────────────────────────
-            # Row 1 (tabs): [Chat] [System *]
-            # Row 2 (actions): [Consolidate] [Cleanup]
-            nhw = 1250  # cell width for 2 columns
-            system_normal_menu = {
-                "size": {"width": 2500, "height": 1686},
-                "selected": True,
-                "name": "nanobot_system_normal",
-                "chatBarText": "System",
-                "areas": [
-                    {"bounds": {"x": 0, "y": 0, "width": thw, "height": tab_h},
-                     "action": {"type": "richmenuswitch", "richMenuAliasId": "nanobot-chat-normal",
-                                "data": "tab=chat"}},
-                    {"bounds": {"x": thw, "y": 0, "width": thw, "height": tab_h},
-                     "action": {"type": "postback", "label": "System", "data": "tab=system"}},
-                    {"bounds": {"x": 0, "y": tab_h, "width": nhw, "height": btn_h},
-                     "action": {"type": "postback", "label": "Consolidate", "data": "action=consolidate",
-                                "displayText": "/consolidate"}},
-                    {"bounds": {"x": nhw, "y": tab_h, "width": nhw, "height": btn_h},
-                     "action": {"type": "postback", "label": "Cleanup", "data": "action=cleanup",
-                                "displayText": "/cleanup"}},
-                ],
-            }
-            resp = await self._http.post(
-                f"{LINE_API_BASE}/richmenu", headers=self._auth_headers, json=system_normal_menu,
-            )
-            if resp.status_code == 200:
-                self._rich_menu_system_normal = resp.json().get("richMenuId")
-                await self._upload_rich_menu_image(self._rich_menu_system_normal, [
-                    [("Chat", (60, 60, 70)), ("System", (40, 100, 160))],
-                    [("Consolidate", (120, 90, 40)), ("Cleanup", (140, 60, 60))],
-                ], **tab_kw, active_tab=1)
-                logger.info("Created system normal Rich Menu: {}", self._rich_menu_system_normal)
-
-            # ── Create aliases for richmenuswitch ────────────────
-            alias_map = {
-                "nanobot-chat-admin": self._rich_menu_chat_admin,
-                "nanobot-chat-normal": self._rich_menu_chat_normal,
-                "nanobot-system-admin": self._rich_menu_system_admin,
-                "nanobot-system-normal": self._rich_menu_system_normal,
-            }
-            for alias_id, menu_id in alias_map.items():
-                if menu_id:
-                    await self._http.post(
-                        f"{LINE_API_BASE}/richmenu/alias",
-                        headers=self._auth_headers,
-                        json={"richMenuAliasId": alias_id, "richMenuId": menu_id},
-                    )
-
-            # Re-link admin menu to known admin users
-            if self._rich_menu_chat_admin and self._access:
+            # Re-link admin menu to known admin users.
+            if self._rich_menu_admin and self._access:
                 admins = self._access._data.get("admins", [])
                 for uid in admins:
-                    await self._link_rich_menu(uid, self._rich_menu_chat_admin)
+                    await self._link_rich_menu(uid, self._rich_menu_admin)
                 if admins:
                     logger.info("Re-linked admin Rich Menu for {} user(s)", len(admins))
 
@@ -1231,6 +1118,55 @@ class LineChannel(BaseChannel):
         except asyncio.CancelledError:
             pass
 
+    def _schedule_processing_stub(self, chat_id: str) -> None:
+        """Schedule a delayed 'processing...' push so Stop becomes tappable.
+
+        Quick-reply buttons only render under sent messages and the loading
+        animation can't carry buttons. If the agent doesn't emit anything
+        within LINE_PROCESSING_STUB_DELAY seconds, push a small stub via the
+        push API so the user can tap Stop while still waiting. The stub is
+        cancelled the moment the agent emits its first real reply.
+        """
+        old = self._stub_tasks.pop(chat_id, None)
+        if old:
+            old.cancel()
+        if not self._should_attach_quick_reply(chat_id):
+            return
+        self._stub_tasks[chat_id] = asyncio.create_task(self._processing_stub_loop(chat_id))
+
+    def _cancel_processing_stub(self, chat_id: str) -> None:
+        """Cancel any pending processing stub task for *chat_id*."""
+        task = self._stub_tasks.pop(chat_id, None)
+        if task:
+            task.cancel()
+
+    async def _processing_stub_loop(self, chat_id: str) -> None:
+        """Wait, then push a 'processing...' stub if the agent is still silent."""
+        try:
+            await asyncio.sleep(LINE_PROCESSING_STUB_DELAY)
+            stub_msg: dict[str, Any] = {"type": "text", "text": "⏳ Processing…"}
+            self._attach_quick_reply([stub_msg], chat_id, is_progress=True)
+            await self._push_messages(chat_id, [stub_msg])
+        except asyncio.CancelledError:
+            pass
+
+    async def _push_messages(self, chat_id: str, messages: list[dict[str, Any]]) -> bool:
+        """Push messages to a chat (counts against monthly quota)."""
+        if not self._http:
+            return False
+        try:
+            resp = await self._http.post(
+                f"{LINE_API_BASE}/message/push",
+                headers=self._auth_headers,
+                json={"to": chat_id, "messages": messages},
+            )
+            if resp.status_code == 200:
+                return True
+            logger.warning("LINE push failed ({}): {}", resp.status_code, resp.text[:200])
+        except Exception as e:
+            logger.warning("LINE push error: {}", e)
+        return False
+
     async def _show_loading(self, chat_id: str) -> None:
         """Show loading animation in LINE chat (lasts 30s)."""
         if not self._http:
@@ -1302,32 +1238,111 @@ class LineChannel(BaseChannel):
         """Return True iff quick-reply buttons should be attached for this chat."""
         if not self.config.quick_reply_enabled:
             return False
-        if not self.config.quick_reply_actions:
-            return False
         source_type = self._chat_source_types.get(chat_id, "user")
         if source_type in ("group", "room") and not self.config.quick_reply_in_groups:
             return False
         return True
 
-    def _build_quick_reply_items(self) -> list[dict[str, Any]]:
-        """Convert configured quick-reply actions to LINE quickReply items (max 13)."""
+    def _is_busy(self, chat_id: str, is_progress: bool) -> bool:
+        """Agent is processing iff this is a progress chunk or a loading task is active."""
+        return is_progress or chat_id in self._loading_tasks
+
+    def _is_queueing(self, chat_id: str, is_busy: bool) -> bool:
+        """Continue is meaningful when a queue exists, or the reply token is near
+        expiry while the agent is still busy (so the user must tap Continue to
+        provide a fresh reply token before the queue starts filling)."""
+        if self._pending_queues.get(chat_id):
+            return True
+        if is_busy:
+            token_entry = self._reply_tokens.get(chat_id)
+            if token_entry and time.monotonic() - token_entry[1] > LINE_REPLY_TOKEN_TTL - 5:
+                return True
+        return False
+
+    def _build_quick_reply_items(
+        self,
+        chat_id: str,
+        is_progress: bool,
+        *,
+        will_queue: bool = False,
+        force_idle: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Build a context-aware quick-reply list (max 13 items).
+
+        ``will_queue=True`` forces the Continue button on (used when this
+        send is about to overflow into the queue). ``force_idle=True`` skips
+        all contextual buttons (used for messages destined for the queue
+        tail, which the user only sees after a flush).
+        """
         items: list[dict[str, Any]] = []
-        for cfg in self.config.quick_reply_actions[:13]:
-            action: dict[str, Any] = {"type": cfg.type, "label": cfg.label}
-            if cfg.type == "postback":
-                action["data"] = cfg.data
-                if cfg.display_text:
-                    action["displayText"] = cfg.display_text
-            elif cfg.type == "message":
-                action["text"] = cfg.text or cfg.label
-            items.append({"type": "action", "action": action})
+        is_busy = False
+        if not force_idle:
+            is_busy = self._is_busy(chat_id, is_progress)
+            if is_busy:
+                items.append({
+                    "type": "action",
+                    "action": {"type": "postback", "label": "Stop", "data": "action=stop"},
+                })
+            if will_queue or self._is_queueing(chat_id, is_busy):
+                items.append({
+                    "type": "action",
+                    "action": {"type": "postback", "label": "Continue",
+                               "data": "action=continue"},
+                })
+        # Static nav (New / Tool / Help) only when the agent is idle — tapping
+        # them mid-processing would interrupt the in-flight reply.
+        if not is_busy:
+            for cfg in self.config.quick_reply_actions:
+                if len(items) >= 13:
+                    break
+                action: dict[str, Any] = {"type": cfg.type, "label": cfg.label}
+                if cfg.type == "postback":
+                    action["data"] = cfg.data
+                    if cfg.display_text:
+                        action["displayText"] = cfg.display_text
+                elif cfg.type == "message":
+                    action["text"] = cfg.text or cfg.label
+                items.append({"type": "action", "action": action})
         return items
 
-    def _attach_quick_reply(self, msg_obj: dict[str, Any]) -> None:
-        """Mutate *msg_obj* in place to add a quickReply block from config."""
-        items = self._build_quick_reply_items()
-        if items:
-            msg_obj["quickReply"] = {"items": items}
+    def _attach_quick_reply(
+        self, messages: list[dict[str, Any]], chat_id: str, is_progress: bool
+    ) -> None:
+        """Attach quick-reply blocks at the user-visible boundaries.
+
+        LINE quick-reply only renders under the message it's attached to,
+        so for overflow batches we attach buttons twice:
+
+        1. To the last text/flex message of the immediately-sent batch (first 5),
+           with current state plus a forced Continue if overflow is imminent.
+           This is what the user actually sees right after sending.
+        2. To the last text/flex message of the queued tail, with idle nav
+           buttons only — by flush time, the user has already chosen to
+           continue and the queue is being drained.
+        """
+        if not messages:
+            return
+        batch_size = LINE_MAX_MESSAGES_PER_PUSH
+        will_overflow = len(messages) > batch_size
+
+        items_now = self._build_quick_reply_items(
+            chat_id, is_progress, will_queue=will_overflow,
+        )
+        if items_now:
+            for m in reversed(messages[:batch_size]):
+                if m.get("type") in ("text", "flex"):
+                    m["quickReply"] = {"items": items_now}
+                    break
+
+        if will_overflow:
+            items_later = self._build_quick_reply_items(
+                chat_id, is_progress=False, force_idle=True,
+            )
+            if items_later:
+                for m in reversed(messages[batch_size:]):
+                    if m.get("type") in ("text", "flex"):
+                        m["quickReply"] = {"items": items_later}
+                        break
 
     def _is_admin(self, chat_id: str) -> bool:
         """Check if a user is admin via access manager."""

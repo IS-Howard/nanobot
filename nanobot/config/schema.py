@@ -35,12 +35,14 @@ class LineConfig(Base):
     quick_reply_enabled: bool = True  # Attach quick-reply buttons to outbound text
     quick_reply_in_groups: bool = False  # Also show in group/room chats (1:1 only by default)
     stickers_enabled: bool = True  # Parse [sticker:pkg/id] markers in outbound text
+    # "Stop" and "Continue" are added contextually based on agent/queue state;
+    # this list provides the additional static navigation buttons.
     quick_reply_actions: list[LineQuickReplyAction] = Field(
         default_factory=lambda: [
             LineQuickReplyAction(label="New", data="action=new"),
-            LineQuickReplyAction(label="Stop", data="action=stop"),
             LineQuickReplyAction(label="Tool", data="action=tool"),
-            LineQuickReplyAction(label="Help", type="message", text="/help"),
+            LineQuickReplyAction(label="Attach", data="action=attach"),
+            LineQuickReplyAction(label="Help", data="action=help"),
         ]
     )
 
