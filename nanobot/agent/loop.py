@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import mimetypes
+import os
 import re
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -102,6 +105,8 @@ class AgentLoop:
         self.storage = storage
         self.tools = ToolRegistry()
         self._tool_mode: dict[str, bool] = {}  # session_key -> persistent tool mode
+        self._pending_media: dict[str, dict[str, str]] = {}  # session_key -> {path, mime}
+        self._attach_next: dict[str, bool] = {}  # session_key -> True when /a was sent
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -574,6 +579,8 @@ class AgentLoop:
             session.clear()
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
+            self._pending_media.pop(key, None)
+            self._attach_next.pop(key, None)
             if self.storage:
                 await self.storage.clear_session(key)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
@@ -623,6 +630,7 @@ class AgentLoop:
             help_text = (
                 "nanobot commands:\n"
                 "/new - Start a new conversation\n"
+                "/a - Process attached file (image/audio/text/PDF)\n"
                 "/consolidate [topic] - Save conversation to memory (optionally focused on a topic)\n"
                 "/cleanup - Compact and deduplicate memory files\n"
                 "/tool - Toggle tool mode\n"
@@ -635,8 +643,132 @@ class AgentLoop:
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content=help_text)
 
-        # Determine tool usage
+        _attach_mode = False  # True when processing attached file content
+
+        # Stash media when messages arrive (latest file only), don't send to LLM
+        if msg.media:
+            path = msg.media[-1]
+            mime, _ = mimetypes.guess_type(path)
+            self._pending_media[key] = {"path": path, "mime": mime or "application/octet-stream"}
+            # If message is ONLY a file marker (no real user text), acknowledge and return
+            stripped = msg.content.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                file_name = Path(path).name
+                meta = dict(msg.metadata or {})
+                # For audio/video: offer transcription confirmation
+                if mime and (mime.startswith("audio/") or mime.startswith("video/")):
+                    meta["_transcribe_confirm"] = True
+                    meta["_file_name"] = file_name
+                    return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                          content=f"Audio received: {file_name}\nTranscribe?",
+                                          metadata=meta)
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content=f"File received: {file_name}. Send /a to process.")
+
+        # /transcribe — transcribe pending audio and save .txt
+        if cmd == "/transcribe":
+            pending = self._pending_media.get(key)
+            if not pending:
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="No pending audio file.")
+            p = Path(pending["path"])
+            mime = pending["mime"]
+            if not (mime.startswith("audio/") or mime.startswith("video/")):
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="Pending file is not audio/video.")
+            txt_path = p.with_suffix(".txt")
+            if txt_path.is_file():
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content=f"Already transcribed ({len(txt_path.read_text(encoding='utf-8'))} chars). Send /a to attach.")
+            transcriber = self._get_transcription()
+            if not transcriber:
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="Transcription unavailable (GROQ_API_KEY not set).")
+            try:
+                logger.info("/transcribe: transcribing {}...", p.name)
+                transcript = await transcriber.transcribe(pending["path"])
+                if transcript:
+                    txt_path.write_text(transcript, encoding="utf-8")
+                    logger.info("/transcribe: saved {} ({} chars)", txt_path, len(transcript))
+                    return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                          content=f"Transcribed ({len(transcript)} chars). Send /a to attach.")
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="Transcription returned empty.")
+            except Exception as e:
+                logger.error("/transcribe: failed: {}", e)
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content=f"Transcription failed: {e}")
+
+        # /a (attach) — flag that the next message will include processed file content
+        if cmd in ("/a", "/attach"):
+            pending = self._pending_media.get(key)
+            if not pending:
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="No pending attachments.")
+            self._attach_next[key] = True
+            mime = pending["mime"]
+            file_name = Path(pending["path"]).name
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content=f"Attaching {file_name} ({mime.split('/')[0]}). Send your message now.")
+
+        # If /a was used previously, process pending media and prepend to this message
+        if self._attach_next.pop(key, False):
+            pending = self._pending_media.get(key)
+            if pending:
+                processed_text, media_content = await self._process_attachment(pending)
+                if media_content is not None:
+                    # Image: build multimodal message and send to LLM directly
+                    user_text = msg.content.strip() or processed_text
+                    history = await self._get_history(key, session)
+                    self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+                    runtime_ctx = ContextBuilder._build_runtime_context(msg.channel, msg.chat_id)
+                    user_content = [{"type": "text", "text": runtime_ctx}] + media_content + [{"type": "text", "text": user_text}]
+                    initial_messages = [
+                        {"role": "system", "content": self.context.build_system_prompt(
+                            sender_id=msg.sender_id,
+                        )},
+                        *history,
+                        {"role": "user", "content": user_content},
+                    ]
+                    async def _bus_progress_img(text: str, *, tool_hint: bool = False) -> None:
+                        meta = dict(msg.metadata or {})
+                        meta["_progress"] = True
+                        meta["_tool_hint"] = tool_hint
+                        await self.bus.publish_outbound(OutboundMessage(
+                            channel=msg.channel, chat_id=msg.chat_id, content=text, metadata=meta,
+                        ))
+                    final_content, _, all_msgs = await self._run_agent_loop(
+                        initial_messages, on_progress=_bus_progress_img, use_tools=False,
+                    )
+                    if final_content is None:
+                        final_content = "I've completed processing but have no response to give."
+                    final_content, global_facts, user_facts = extract_memorize_tags(final_content)
+                    if global_facts or user_facts:
+                        store = MemoryStore(self.workspace)
+                        for fact in global_facts:
+                            store.append_global_memory(fact)
+                        for fact in user_facts:
+                            store.append_user_memory(msg.sender_id, fact)
+                    await self._save_turn_to_storage(key, session, all_msgs, 1 + len(history))
+                    return OutboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id, content=final_content,
+                        metadata=msg.metadata or {},
+                    )
+                else:
+                    # Non-image: prepend processed text to user's message
+                    # Wrap in XML tags so the LLM treats it as data, not instructions
+                    msg = InboundMessage(
+                        channel=msg.channel, sender_id=msg.sender_id, chat_id=msg.chat_id,
+                        content=f"<attached_file>\n{processed_text}\n</attached_file>\n\nUser request: {msg.content}",
+                        timestamp=msg.timestamp, metadata=msg.metadata,
+                        session_key_override=msg.session_key_override,
+                    )
+                    _attach_mode = True
+
+        # Determine tool usage (disabled for attach mode — file content is untrusted)
         use_tools, content = self._should_use_tools(key, msg.content, sender_id=msg.sender_id)
+        if _attach_mode:
+            use_tools = False
 
         # Resolve access-control filtered tool/skill lists
         allowed_tools = self.access.get_allowed_tools(msg.sender_id) if self.access else None
@@ -748,6 +880,106 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
             metadata=msg.metadata or {},
         )
+
+    async def _process_attachment(self, pending: dict[str, str]) -> tuple[str, list[dict] | None]:
+        """Process a pending media attachment.
+
+        Returns (text_content, multimodal_content).
+        multimodal_content is a list of image_url dicts for images, None otherwise.
+        """
+        path = pending["path"]
+        mime = pending["mime"]
+        p = Path(path)
+        file_name = p.name
+
+        if not p.is_file():
+            logger.warning("/a: file not found: {}", path)
+            return f"File not found: {file_name}", None
+
+        logger.info("/a: processing {} ({})", file_name, mime)
+
+        # Image: base64-encode for multimodal vision
+        if mime.startswith("image/"):
+            b64 = base64.b64encode(p.read_bytes()).decode()
+            media_content = [{"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}]
+            logger.info("/a: image ready for vision ({} bytes)", len(b64))
+            return f"[Image: {file_name}] Describe and analyze this image.", media_content
+
+        # Audio: transcribe via Groq (cached as .txt alongside the audio)
+        if mime.startswith("audio/"):
+            txt_path = p.with_suffix(".txt")
+            if txt_path.is_file():
+                transcript = txt_path.read_text(encoding="utf-8")
+                logger.info("/a: using cached transcript ({} chars)", len(transcript))
+                return f"[Audio: {file_name}]\nTranscript:\n{transcript}", None
+            transcriber = self._get_transcription()
+            if not transcriber:
+                logger.warning("/a: GROQ_API_KEY not set, cannot transcribe")
+                return f"[Audio: {file_name}] Transcription unavailable (GROQ_API_KEY not set).", None
+            try:
+                logger.info("/a: transcribing audio...")
+                transcript = await transcriber.transcribe(path)
+                if transcript:
+                    txt_path.write_text(transcript, encoding="utf-8")
+                    logger.info("/a: transcript saved to {} ({} chars)", txt_path, len(transcript))
+                    return f"[Audio: {file_name}]\nTranscript:\n{transcript}", None
+                logger.warning("/a: transcription returned empty")
+                return f"[Audio: {file_name}] Transcription returned empty.", None
+            except Exception as e:
+                logger.error("/a: transcription failed: {}", e)
+                return f"[Audio: {file_name}] Transcription failed: {e}", None
+
+        # PDF: extract text via pymupdf (cached as .txt alongside the PDF)
+        if mime == "application/pdf":
+            txt_path = p.with_suffix(".pdf.txt")
+            if txt_path.is_file():
+                extracted = txt_path.read_text(encoding="utf-8")
+                logger.info("/a: using cached PDF text ({} chars)", len(extracted))
+                return f"[PDF: {file_name}]\n{extracted}", None
+            try:
+                import fitz
+                doc = fitz.open(path)
+                text_parts = []
+                for page in doc:
+                    text_parts.append(page.get_text())
+                doc.close()
+                extracted = "\n".join(text_parts).strip()
+                if extracted:
+                    txt_path.write_text(extracted, encoding="utf-8")
+                    logger.info("/a: PDF text saved to {} ({} chars)", txt_path, len(extracted))
+                    return f"[PDF: {file_name}]\n{extracted}", None
+                return f"[PDF: {file_name}] No text extracted (may be image-based).", None
+            except ImportError:
+                return f"[PDF: {file_name}] PDF extraction unavailable (pymupdf not installed).", None
+            except Exception as e:
+                return f"[PDF: {file_name}] PDF extraction failed: {e}", None
+
+        # Text files: read content
+        text_extensions = {
+            ".txt", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".md",
+            ".csv", ".xml", ".html", ".css", ".sh", ".bat", ".cfg", ".ini",
+            ".toml", ".log", ".sql", ".env", ".gitignore", ".dockerfile",
+        }
+        is_text = mime.startswith("text/") or p.suffix.lower() in text_extensions
+        if is_text:
+            try:
+                file_content = p.read_text(encoding="utf-8", errors="replace")
+                return f"[File: {file_name}]\n{file_content}", None
+            except Exception as e:
+                return f"[File: {file_name}] Failed to read: {e}", None
+
+        # Other: show file info
+        size = p.stat().st_size
+        size_str = f"{size / 1024:.1f} KB" if size >= 1024 else f"{size} bytes"
+        return f"[File: {file_name}] ({mime}, {size_str}) — unsupported format for direct processing.", None
+
+    def _get_transcription(self):
+        """Lazily create a GroqTranscriptionProvider if API key is available."""
+        key = os.environ.get("GROQ_API_KEY")
+        if not key:
+            return None
+        from nanobot.providers.transcription import GroqTranscriptionProvider
+        return GroqTranscriptionProvider(api_key=key)
 
     def _handle_admin_command(self, msg: InboundMessage) -> OutboundMessage:
         """Handle /admin slash commands."""

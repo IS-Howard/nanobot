@@ -56,6 +56,28 @@ _EXT_TYPES: dict[str, tuple[str, str]] = {
 
 
 
+def _flex_transcribe_confirm(file_name: str) -> dict:
+    """Build Flex bubble asking user to confirm audio transcription."""
+    return {
+        "type": "flex", "altText": f"Transcribe {file_name}?",
+        "contents": {
+            "type": "bubble", "size": "kilo",
+            "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
+                {"type": "text", "text": "Audio Received", "weight": "bold", "size": "md"},
+                {"type": "text", "text": file_name, "size": "sm", "color": "#666666", "wrap": True},
+            ]},
+            "footer": {"type": "box", "layout": "horizontal", "spacing": "md", "contents": [
+                {"type": "button", "style": "primary", "color": "#06C755", "height": "sm",
+                 "action": {"type": "postback", "label": "Transcribe",
+                            "data": "action=transcribe", "displayText": "/transcribe"}},
+                {"type": "button", "style": "secondary", "height": "sm",
+                 "action": {"type": "postback", "label": "Skip",
+                            "data": "action=skip_transcribe", "displayText": "skip"}},
+            ]},
+        },
+    }
+
+
 def _flex_tool_status(content: str) -> dict | None:
     """Build Flex bubble for tool mode toggle response."""
     # Parse "Tool mode ON (model: ...)" or "Tool mode OFF"
@@ -529,7 +551,9 @@ class LineChannel(BaseChannel):
         # Check if content should be upgraded to Flex Message
         flex_msg = None
         if msg.content and not is_progress:
-            if msg.metadata.get("_admin_panel"):
+            if msg.metadata.get("_transcribe_confirm"):
+                flex_msg = _flex_transcribe_confirm(msg.metadata.get("_file_name", "audio"))
+            elif msg.metadata.get("_admin_panel"):
                 flex_msg = _flex_admin_panel(
                     msg.metadata.get("tools", []),
                     msg.metadata.get("skills", []),
@@ -713,10 +737,16 @@ class LineChannel(BaseChannel):
             "cleanup": "/cleanup",
             "new": "/new",
             "stop": "/stop",
+            "attach": "/a",
+            "transcribe": "/transcribe",
             "admin_panel": "/admin panel",
         }
         params = dict(p.split("=", 1) for p in data.split("&") if "=" in p)
         action = params.get("action", "")
+
+        # Skip transcription — no-op, just ignore
+        if action == "skip_transcribe":
+            return
 
         # Handle "continue" postback — flush queued messages
         if action == "continue":
@@ -812,8 +842,8 @@ class LineChannel(BaseChannel):
 
             # ── Chat Admin: 2 rows ──────────────────────────────
             # Row 1 (tabs): [Chat *] [System]
-            # Row 2 (actions): [New] [Stop] [Continue] [Tool]
-            cw4 = 625  # cell width for 4 columns
+            # Row 2 (actions): [New] [Stop] [Attach] [Continue] [Tool]
+            cw5 = 500  # cell width for 5 columns
             chat_admin_menu = {
                 "size": {"width": 2500, "height": 1686},
                 "selected": True,
@@ -827,16 +857,19 @@ class LineChannel(BaseChannel):
                      "action": {"type": "richmenuswitch", "richMenuAliasId": "nanobot-system-admin",
                                 "data": "tab=system"}},
                     # Action row
-                    {"bounds": {"x": 0, "y": tab_h, "width": cw4, "height": btn_h},
+                    {"bounds": {"x": 0, "y": tab_h, "width": cw5, "height": btn_h},
                      "action": {"type": "postback", "label": "New", "data": "action=new",
                                 "displayText": "/new"}},
-                    {"bounds": {"x": cw4, "y": tab_h, "width": cw4, "height": btn_h},
+                    {"bounds": {"x": cw5, "y": tab_h, "width": cw5, "height": btn_h},
                      "action": {"type": "postback", "label": "Stop", "data": "action=stop",
                                 "displayText": "/stop"}},
-                    {"bounds": {"x": cw4 * 2, "y": tab_h, "width": cw4, "height": btn_h},
+                    {"bounds": {"x": cw5 * 2, "y": tab_h, "width": cw5, "height": btn_h},
+                     "action": {"type": "postback", "label": "Attach", "data": "action=attach",
+                                "displayText": "/a"}},
+                    {"bounds": {"x": cw5 * 3, "y": tab_h, "width": cw5, "height": btn_h},
                      "action": {"type": "postback", "label": "Continue", "data": "action=continue",
                                 "displayText": "."}},
-                    {"bounds": {"x": cw4 * 3, "y": tab_h, "width": cw4, "height": btn_h},
+                    {"bounds": {"x": cw5 * 4, "y": tab_h, "width": cw5, "height": btn_h},
                      "action": {"type": "postback", "label": "Tool", "data": "action=tool",
                                 "displayText": "/tool"}},
                 ],
@@ -849,14 +882,14 @@ class LineChannel(BaseChannel):
                 await self._upload_rich_menu_image(self._rich_menu_chat_admin, [
                     [("Chat", (40, 100, 160)), ("System", (60, 60, 70))],
                     [("New", (50, 130, 80)), ("Stop", (180, 50, 50)),
-                     ("Continue", (0, 120, 60)), ("Tool", (50, 90, 160))],
+                     ("Attach", (100, 80, 140)), ("Continue", (0, 120, 60)), ("Tool", (50, 90, 160))],
                 ], **tab_kw, active_tab=0)
                 logger.info("Created chat admin Rich Menu: {}", self._rich_menu_chat_admin)
 
             # ── Chat Normal: 2 rows ─────────────────────────────
             # Row 1 (tabs): [Chat *] [System]
-            # Row 2 (actions): [New] [Stop] [Continue]
-            cw3 = 833  # cell width for 3 columns
+            # Row 2 (actions): [New] [Stop] [Attach] [Continue]
+            cw4 = 625  # cell width for 4 columns
             chat_normal_menu = {
                 "size": {"width": 2500, "height": 1686},
                 "selected": True,
@@ -868,13 +901,16 @@ class LineChannel(BaseChannel):
                     {"bounds": {"x": thw, "y": 0, "width": thw, "height": tab_h},
                      "action": {"type": "richmenuswitch", "richMenuAliasId": "nanobot-system-normal",
                                 "data": "tab=system"}},
-                    {"bounds": {"x": 0, "y": tab_h, "width": cw3, "height": btn_h},
+                    {"bounds": {"x": 0, "y": tab_h, "width": cw4, "height": btn_h},
                      "action": {"type": "postback", "label": "New", "data": "action=new",
                                 "displayText": "/new"}},
-                    {"bounds": {"x": cw3, "y": tab_h, "width": cw3 + 1, "height": btn_h},
+                    {"bounds": {"x": cw4, "y": tab_h, "width": cw4, "height": btn_h},
                      "action": {"type": "postback", "label": "Stop", "data": "action=stop",
                                 "displayText": "/stop"}},
-                    {"bounds": {"x": cw3 * 2, "y": tab_h, "width": cw3 + 1, "height": btn_h},
+                    {"bounds": {"x": cw4 * 2, "y": tab_h, "width": cw4, "height": btn_h},
+                     "action": {"type": "postback", "label": "Attach", "data": "action=attach",
+                                "displayText": "/a"}},
+                    {"bounds": {"x": cw4 * 3, "y": tab_h, "width": cw4, "height": btn_h},
                      "action": {"type": "postback", "label": "Continue", "data": "action=continue",
                                 "displayText": "."}},
                 ],
@@ -886,7 +922,8 @@ class LineChannel(BaseChannel):
                 self._rich_menu_chat_normal = resp.json().get("richMenuId")
                 await self._upload_rich_menu_image(self._rich_menu_chat_normal, [
                     [("Chat", (40, 100, 160)), ("System", (60, 60, 70))],
-                    [("New", (50, 130, 80)), ("Stop", (180, 50, 50)), ("Continue", (0, 120, 60))],
+                    [("New", (50, 130, 80)), ("Stop", (180, 50, 50)),
+                     ("Attach", (100, 80, 140)), ("Continue", (0, 120, 60))],
                 ], **tab_kw, active_tab=0)
                 # Set as default for all users
                 await self._http.post(
@@ -898,6 +935,7 @@ class LineChannel(BaseChannel):
             # ── System Admin: 2 rows ────────────────────────────
             # Row 1 (tabs): [Chat] [System *]
             # Row 2 (actions): [Consolidate] [Cleanup] [Admin]
+            cw3 = 833  # cell width for 3 columns
             system_admin_menu = {
                 "size": {"width": 2500, "height": 1686},
                 "selected": True,

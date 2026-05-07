@@ -275,6 +275,12 @@ def gateway(
 
     config = load_config()
     sync_workspace_templates(config.workspace_path)
+
+    # Export Groq API key to env for transcription (used by /a command)
+    if config.providers.groq.api_key:
+        import os
+        os.environ.setdefault("GROQ_API_KEY", config.providers.groq.api_key)
+
     bus = MessageBus()
     provider, tool_provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
@@ -481,6 +487,11 @@ def agent(
 
     config = load_config()
     sync_workspace_templates(config.workspace_path)
+
+    # Export Groq API key to env for transcription (used by /a command)
+    if config.providers.groq.api_key:
+        import os
+        os.environ.setdefault("GROQ_API_KEY", config.providers.groq.api_key)
 
     bus = MessageBus()
     provider, tool_provider = _make_provider(config)
