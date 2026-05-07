@@ -19,6 +19,11 @@ from loguru import logger
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.channels.line_format import (
+    extract_stickers,
+    markdown_to_line_text,
+    smart_split_text,
+)
 from nanobot.config.schema import LineConfig
 
 if TYPE_CHECKING:
@@ -480,6 +485,8 @@ class LineChannel(BaseChannel):
         self._pending_queues: dict[str, list[dict[str, Any]]] = {}
         # Loading animation keep-alive tasks per chat
         self._loading_tasks: dict[str, asyncio.Task[None]] = {}
+        # Track latest source_type per chat ("user" | "group" | "room") for quick-reply gating
+        self._chat_source_types: dict[str, str] = {}
 
     async def start(self) -> None:
         """Start webhook server and listen for LINE events."""
@@ -570,8 +577,18 @@ class LineChannel(BaseChannel):
         if flex_msg:
             messages.append(flex_msg)
         elif msg.content:
-            for chunk in _split_text(msg.content, LINE_MAX_TEXT):
-                messages.append({"type": "text", "text": chunk})
+            sanitized = markdown_to_line_text(msg.content)
+            segments = (
+                extract_stickers(sanitized)
+                if self.config.stickers_enabled
+                else [("text", sanitized)]
+            )
+            for kind, payload in segments:
+                if kind == "sticker":
+                    messages.append({"type": "sticker", **payload})
+                else:
+                    for chunk in smart_split_text(payload, LINE_MAX_TEXT):
+                        messages.append({"type": "text", "text": chunk})
 
         # Media messages
         for media_url in msg.media or []:
@@ -580,6 +597,23 @@ class LineChannel(BaseChannel):
                 "originalContentUrl": media_url,
                 "previewImageUrl": media_url,
             })
+
+        # Attach quick-reply buttons to the LAST text message (1:1 by default).
+        # Skip when this is a Flex/special-mode response or a streaming progress chunk.
+        is_special = bool(
+            msg.metadata.get("_admin_panel")
+            or msg.metadata.get("_transcribe_confirm")
+        )
+        if (
+            not is_progress
+            and not flex_msg
+            and not is_special
+            and self._should_attach_quick_reply(msg.chat_id)
+        ):
+            for m in reversed(messages):
+                if m.get("type") == "text":
+                    self._attach_quick_reply(m)
+                    break
 
         if not messages:
             return
@@ -659,6 +693,7 @@ class LineChannel(BaseChannel):
             chat_id = source.get("roomId", sender_id)
         else:
             chat_id = sender_id
+        self._chat_source_types[chat_id] = source_type
 
         message = event.get("message", {})
         msg_type = message.get("type", "")
@@ -784,6 +819,7 @@ class LineChannel(BaseChannel):
             chat_id = source.get("roomId", sender_id)
         else:
             chat_id = sender_id
+        self._chat_source_types[chat_id] = source_type
 
         reply_token = event.get("replyToken", "")
         if reply_token:
@@ -1262,6 +1298,37 @@ class LineChannel(BaseChannel):
         return True
 
 
+    def _should_attach_quick_reply(self, chat_id: str) -> bool:
+        """Return True iff quick-reply buttons should be attached for this chat."""
+        if not self.config.quick_reply_enabled:
+            return False
+        if not self.config.quick_reply_actions:
+            return False
+        source_type = self._chat_source_types.get(chat_id, "user")
+        if source_type in ("group", "room") and not self.config.quick_reply_in_groups:
+            return False
+        return True
+
+    def _build_quick_reply_items(self) -> list[dict[str, Any]]:
+        """Convert configured quick-reply actions to LINE quickReply items (max 13)."""
+        items: list[dict[str, Any]] = []
+        for cfg in self.config.quick_reply_actions[:13]:
+            action: dict[str, Any] = {"type": cfg.type, "label": cfg.label}
+            if cfg.type == "postback":
+                action["data"] = cfg.data
+                if cfg.display_text:
+                    action["displayText"] = cfg.display_text
+            elif cfg.type == "message":
+                action["text"] = cfg.text or cfg.label
+            items.append({"type": "action", "action": action})
+        return items
+
+    def _attach_quick_reply(self, msg_obj: dict[str, Any]) -> None:
+        """Mutate *msg_obj* in place to add a quickReply block from config."""
+        items = self._build_quick_reply_items()
+        if items:
+            msg_obj["quickReply"] = {"items": items}
+
     def _is_admin(self, chat_id: str) -> bool:
         """Check if a user is admin via access manager."""
         if not self._access:
@@ -1270,18 +1337,5 @@ class LineChannel(BaseChannel):
 
 
 def _split_text(text: str, limit: int = LINE_MAX_TEXT) -> list[str]:
-    """Split text into chunks respecting the LINE character limit."""
-    if len(text) <= limit:
-        return [text]
-    chunks: list[str] = []
-    while text:
-        if len(text) <= limit:
-            chunks.append(text)
-            break
-        # Try to split at last newline before limit
-        idx = text.rfind("\n", 0, limit)
-        if idx <= 0:
-            idx = limit
-        chunks.append(text[:idx])
-        text = text[idx:].lstrip("\n")
-    return chunks
+    """Backward-compatible shim — delegate to smart_split_text in line_format."""
+    return smart_split_text(text, limit)

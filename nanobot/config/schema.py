@@ -12,6 +12,16 @@ class Base(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
 
+class LineQuickReplyAction(Base):
+    """One quick-reply button attached to outbound text messages."""
+
+    label: str  # ≤20 chars per LINE spec
+    type: str = "postback"  # postback | message | uri | camera | cameraRoll | location | datetimepicker
+    data: str = ""  # for type=postback
+    text: str = ""  # for type=message
+    display_text: str = ""
+
+
 class LineConfig(Base):
     """LINE Messaging API channel configuration (webhook-based)."""
 
@@ -22,6 +32,17 @@ class LineConfig(Base):
     port: int = 18800  # Webhook server port
     webhook_path: str = "/line/webhook"  # Webhook endpoint path
     allow_from: list[str] = Field(default_factory=list)  # Allowed LINE user IDs
+    quick_reply_enabled: bool = True  # Attach quick-reply buttons to outbound text
+    quick_reply_in_groups: bool = False  # Also show in group/room chats (1:1 only by default)
+    stickers_enabled: bool = True  # Parse [sticker:pkg/id] markers in outbound text
+    quick_reply_actions: list[LineQuickReplyAction] = Field(
+        default_factory=lambda: [
+            LineQuickReplyAction(label="New", data="action=new"),
+            LineQuickReplyAction(label="Stop", data="action=stop"),
+            LineQuickReplyAction(label="Tool", data="action=tool"),
+            LineQuickReplyAction(label="Help", type="message", text="/help"),
+        ]
+    )
 
 
 class ChannelsConfig(Base):
