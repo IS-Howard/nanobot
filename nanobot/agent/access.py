@@ -18,6 +18,15 @@ class AccessManager:
         "admins": [],
         "user_allowed_tools": [],
         "user_allowed_skills": [],
+        # Per-admin workspace-restriction overrides:
+        #   True  => force restricted to workspace
+        #   False => force unrestricted (full FS + shell)
+        #   absent => follow the static config default
+        "admin_workspace_overrides": {},
+        # Per-admin self-allowlists. Absent or empty entry => no self-restriction
+        # (admin gets all tools/skills). A non-empty list is enforced.
+        "admin_self_allowed_tools": {},
+        "admin_self_allowed_skills": {},
     }
 
     def __init__(self, workspace: Path):
@@ -43,15 +52,122 @@ class AccessManager:
         return True
 
     def get_allowed_tools(self, sender_id: str) -> list[str] | None:
-        """Return *None* (all) for admins, or the filtered list for normal users."""
+        """Return *None* (all) when no allowlist applies, else the allowlist.
+
+        Admins default to *None*; an admin who has configured a personal
+        self-allowlist (non-empty) gets that list applied to themselves only.
+        Normal users see the shared ``user_allowed_tools`` list.
+        """
         if self.is_admin(sender_id):
+            self_list = self._data.get("admin_self_allowed_tools", {}).get(sender_id)
+            if self_list:
+                return list(self_list)
             return None
         return list(self._data.get("user_allowed_tools", []))
 
     def get_allowed_skills(self, sender_id: str) -> list[str] | None:
         if self.is_admin(sender_id):
+            self_list = self._data.get("admin_self_allowed_skills", {}).get(sender_id)
+            if self_list:
+                return list(self_list)
             return None
         return list(self._data.get("user_allowed_skills", []))
+
+    def get_workspace_override(self, sender_id: str) -> bool | None:
+        """Return this admin's explicit override (True=restricted, False=unrestricted),
+        or None if they follow the config default.
+        """
+        return self._data.get("admin_workspace_overrides", {}).get(sender_id)
+
+    def is_workspace_restricted(self, sender_id: str | None, default: bool) -> bool:
+        """Resolve effective workspace restriction for a caller.
+
+        Normal users are always restricted. Admins follow their explicit override
+        if set, otherwise the static config *default*. Unknown senders fall back
+        to *default*.
+        """
+        if not sender_id:
+            return default
+        if not self.is_admin(sender_id):
+            return True
+        override = self.get_workspace_override(sender_id)
+        if override is not None:
+            return override
+        return default
+
+    def set_workspace_override(self, sender_id: str, restricted: bool | None) -> None:
+        """Set or clear this admin's workspace override.
+
+        ``restricted=True`` forces restricted-to-workspace, ``False`` forces
+        unrestricted, ``None`` clears the override (revert to config default).
+        """
+        store: dict[str, bool] = self._data.setdefault("admin_workspace_overrides", {})
+        if restricted is None:
+            if sender_id in store:
+                store.pop(sender_id, None)
+                self._save()
+            return
+        if store.get(sender_id) != restricted:
+            store[sender_id] = restricted
+            self._save()
+
+    # ── Per-admin self-allowlists ─────────────────────────────────────
+
+    def get_admin_self_tools(self, sender_id: str) -> list[str] | None:
+        """Return the admin's self-allowlist if configured, else None (all)."""
+        lst = self._data.get("admin_self_allowed_tools", {}).get(sender_id)
+        return list(lst) if lst else None
+
+    def get_admin_self_skills(self, sender_id: str) -> list[str] | None:
+        lst = self._data.get("admin_self_allowed_skills", {}).get(sender_id)
+        return list(lst) if lst else None
+
+    def toggle_admin_self_tool(
+        self, sender_id: str, name: str, all_tools: list[str]
+    ) -> bool:
+        """Toggle *name* in this admin's self-allowlist. Returns the new state.
+
+        On first use the list is initialized from *all_tools* (everything ON),
+        then *name* is flipped off — so toggling matches the user's mental model
+        of "everything available, except what I disabled".
+        """
+        return self._toggle_admin_self("admin_self_allowed_tools", sender_id, name, all_tools)
+
+    def toggle_admin_self_skill(
+        self, sender_id: str, name: str, all_skills: list[str]
+    ) -> bool:
+        return self._toggle_admin_self(
+            "admin_self_allowed_skills", sender_id, name, all_skills
+        )
+
+    def _toggle_admin_self(
+        self, key: str, sender_id: str, name: str, all_known: list[str]
+    ) -> bool:
+        store: dict[str, list[str]] = self._data.setdefault(key, {})
+        lst = store.get(sender_id)
+        if not lst:
+            lst = [item for item in all_known if item != name]
+            store[sender_id] = lst
+            self._save()
+            return False
+        if name in lst:
+            lst.remove(name)
+            self._save()
+            return False
+        lst.append(name)
+        self._save()
+        return True
+
+    def clear_admin_self(self, sender_id: str) -> None:
+        """Drop this admin's tool/skill self-allowlists (back to all-allowed)."""
+        changed = False
+        for key in ("admin_self_allowed_tools", "admin_self_allowed_skills"):
+            store: dict[str, list[str]] = self._data.get(key, {})
+            if sender_id in store:
+                store.pop(sender_id, None)
+                changed = True
+        if changed:
+            self._save()
 
     # ── Mutations (admin-only in practice) ────────────────────────────
 
@@ -93,6 +209,12 @@ class AccessManager:
         admins: list[str] = self._data.get("admins", [])
         if sender_id in admins:
             admins.remove(sender_id)
+            for key in (
+                "admin_workspace_overrides",
+                "admin_self_allowed_tools",
+                "admin_self_allowed_skills",
+            ):
+                self._data.get(key, {}).pop(sender_id, None)
             self._save()
             return True
         return False
@@ -111,10 +233,21 @@ class AccessManager:
         if self._path.exists():
             try:
                 self._data = json.loads(self._path.read_text(encoding="utf-8"))
+                self._migrate_legacy()
                 return
             except (json.JSONDecodeError, OSError) as e:
                 logger.warning("Failed to load access.json, using defaults: {}", e)
         self._data = dict(self._DEFAULT)
+
+    def _migrate_legacy(self) -> None:
+        """One-time upgrade of legacy ``unrestricted_admins`` list to overrides dict."""
+        legacy = self._data.pop("unrestricted_admins", None)
+        if not legacy:
+            return
+        store: dict[str, bool] = self._data.setdefault("admin_workspace_overrides", {})
+        for sid in legacy:
+            store.setdefault(sid, False)  # legacy entry meant "force unrestricted"
+        self._save()
 
     def _save(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)

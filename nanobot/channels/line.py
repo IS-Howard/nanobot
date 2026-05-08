@@ -147,14 +147,32 @@ def _flex_admin_panel(
     skills: list[str],
     allowed_tools: list[str],
     allowed_skills: list[str],
+    self_allowed_tools: list[str] | None = None,
+    self_allowed_skills: list[str] | None = None,
+    workspace_restricted: bool = True,
+    workspace_override: bool | None = None,
+    workspace_default: bool = False,
 ) -> dict:
-    """Build Flex carousel for the admin permissions panel."""
-    def _toggle_bubble(title: str, items: list[str], enabled: list[str], action_prefix: str) -> dict:
+    """Build Flex carousel for the admin permissions panel.
+
+    Sections rendered (in order):
+      1. Workspace — toggle the caller-admin's workspace restriction.
+      2. Your Tools / Your Skills — per-admin self-allowlist. ``None`` means
+         no self-restriction (everything ON); a list materializes the allowlist.
+      3. Normal-user Tools / Skills — the shared allowlist for non-admins.
+    """
+    def _toggle_bubble(
+        title: str,
+        items: list[str],
+        enabled: list[str],
+        action_prefix: str,
+        all_on: bool = False,
+        subtitle: str | None = None,
+    ) -> dict:
         rows: list[dict] = []
         for name in items:
-            is_on = name in enabled
+            is_on = all_on or name in enabled
             color = "#06C755" if is_on else "#CCCCCC"
-            label = f"{'ON' if is_on else 'OFF'} {name}"
             rows.append({
                 "type": "box", "layout": "horizontal", "spacing": "sm",
                 "margin": "sm",
@@ -172,25 +190,118 @@ def _flex_admin_panel(
             })
         if not rows:
             rows.append({"type": "text", "text": "(none)", "size": "sm", "color": "#999999"})
+        body_contents: list[dict] = [
+            {"type": "text", "text": title, "weight": "bold", "size": "md"},
+        ]
+        if subtitle:
+            body_contents.append(
+                {"type": "text", "text": subtitle, "size": "xs", "color": "#888888", "wrap": True}
+            )
+        body_contents.append({"type": "separator", "margin": "md"})
+        body_contents.append(
+            {"type": "box", "layout": "vertical", "margin": "md", "contents": rows}
+        )
         return {
             "type": "bubble", "size": "kilo",
-            "body": {"type": "box", "layout": "vertical", "contents": [
-                {"type": "text", "text": title, "weight": "bold", "size": "md"},
-                {"type": "separator", "margin": "md"},
-                {"type": "box", "layout": "vertical", "margin": "md", "contents": rows},
-            ]},
+            "body": {"type": "box", "layout": "vertical", "contents": body_contents},
         }
 
-    bubbles = []
-    # Split tools into groups of 8 per bubble
+    def _workspace_bubble() -> dict:
+        state_text = "RESTRICTED" if workspace_restricted else "UNRESTRICTED"
+        state_color = "#CC4444" if workspace_restricted else "#06C755"
+        # Buttons flip to the *opposite* of the current state.
+        next_value = "on" if not workspace_restricted else "off"
+        next_label = "Restrict me" if not workspace_restricted else "Unrestrict me"
+        if workspace_override is None:
+            source_text = (
+                f"Source: config default ({'restricted' if workspace_default else 'unrestricted'})"
+            )
+        else:
+            source_text = "Source: your explicit override"
+        contents = [
+            {"type": "text", "text": "Workspace (you)", "weight": "bold", "size": "md"},
+            {"type": "text", "text": "Filesystem + shell scope for your sessions",
+             "size": "xs", "color": "#888888", "wrap": True},
+            {"type": "separator", "margin": "md"},
+            {"type": "box", "layout": "vertical", "margin": "md", "spacing": "sm", "contents": [
+                {"type": "text", "text": state_text, "weight": "bold",
+                 "size": "lg", "color": state_color, "align": "center"},
+                {"type": "text",
+                 "text": ("Restricted to workspace dir." if workspace_restricted
+                          else "Full filesystem and shell access."),
+                 "size": "xs", "color": "#666666", "wrap": True, "align": "center"},
+                {"type": "text", "text": source_text,
+                 "size": "xxs", "color": "#999999", "wrap": True, "align": "center"},
+            ]},
+            {"type": "button", "style": "primary", "margin": "md",
+             "action": {
+                 "type": "postback",
+                 "label": next_label,
+                 "data": f"action=workspace_toggle&value={next_value}",
+                 "displayText": f"/admin workspace {next_value}",
+             }},
+        ]
+        if workspace_override is not None:
+            contents.append({"type": "button", "style": "secondary", "margin": "sm",
+                "action": {
+                    "type": "postback",
+                    "label": "Reset to default",
+                    "data": "action=workspace_toggle&value=reset",
+                    "displayText": "/admin workspace reset",
+                }})
+        contents.append({"type": "button", "style": "secondary", "margin": "sm",
+            "action": {
+                "type": "postback",
+                "label": "Reset my tool/skill",
+                "data": "action=self_reset",
+                "displayText": "/admin self_reset",
+            }})
+        return {
+            "type": "bubble", "size": "kilo",
+            "body": {"type": "box", "layout": "vertical", "contents": contents},
+        }
+
+    bubbles: list[dict] = [_workspace_bubble()]
+
+    self_unset_tools = self_allowed_tools is None
+    self_unset_skills = self_allowed_skills is None
+    self_t = list(self_allowed_tools or [])
+    self_s = list(self_allowed_skills or [])
+
+    sub_self_tools = ("All ON (no self-restriction). Tap to start an allowlist."
+                      if self_unset_tools else "Your personal allowlist.")
+    sub_self_skills = ("All ON (no self-restriction). Tap to start an allowlist."
+                       if self_unset_skills else "Your personal allowlist.")
+
+    # Your tools (split 8 per bubble)
     for i in range(0, max(len(tools), 1), 8):
         chunk = tools[i:i + 8]
-        label = "Tools" if i == 0 else f"Tools ({i + 1}+)"
-        bubbles.append(_toggle_bubble(label, chunk, allowed_tools, "toggle_tool"))
+        label = "Your Tools" if i == 0 else f"Your Tools ({i + 1}+)"
+        sub = sub_self_tools if i == 0 else None
+        bubbles.append(_toggle_bubble(
+            label, chunk, self_t, "self_toggle_tool",
+            all_on=self_unset_tools, subtitle=sub,
+        ))
     for i in range(0, max(len(skills), 1), 8):
         chunk = skills[i:i + 8]
-        label = "Skills" if i == 0 else f"Skills ({i + 1}+)"
-        bubbles.append(_toggle_bubble(label, chunk, allowed_skills, "toggle_skill"))
+        label = "Your Skills" if i == 0 else f"Your Skills ({i + 1}+)"
+        sub = sub_self_skills if i == 0 else None
+        bubbles.append(_toggle_bubble(
+            label, chunk, self_s, "self_toggle_skill",
+            all_on=self_unset_skills, subtitle=sub,
+        ))
+
+    # Normal-user tools/skills
+    for i in range(0, max(len(tools), 1), 8):
+        chunk = tools[i:i + 8]
+        label = "User Tools" if i == 0 else f"User Tools ({i + 1}+)"
+        sub = "Shared allowlist for non-admins." if i == 0 else None
+        bubbles.append(_toggle_bubble(label, chunk, allowed_tools, "toggle_tool", subtitle=sub))
+    for i in range(0, max(len(skills), 1), 8):
+        chunk = skills[i:i + 8]
+        label = "User Skills" if i == 0 else f"User Skills ({i + 1}+)"
+        sub = "Shared allowlist for non-admins." if i == 0 else None
+        bubbles.append(_toggle_bubble(label, chunk, allowed_skills, "toggle_skill", subtitle=sub))
 
     return {
         "type": "flex", "altText": "Admin Panel",
@@ -573,6 +684,11 @@ class LineChannel(BaseChannel):
                     msg.metadata.get("skills", []),
                     msg.metadata.get("allowed_tools", []),
                     msg.metadata.get("allowed_skills", []),
+                    self_allowed_tools=msg.metadata.get("self_allowed_tools"),
+                    self_allowed_skills=msg.metadata.get("self_allowed_skills"),
+                    workspace_restricted=msg.metadata.get("workspace_restricted", True),
+                    workspace_override=msg.metadata.get("workspace_override"),
+                    workspace_default=msg.metadata.get("workspace_default", False),
                 )
             else:
                 flex_msg = _flex_tool_status(msg.content) or _flex_help(msg.content)
@@ -796,9 +912,14 @@ class LineChannel(BaseChannel):
             await self._flush_queue(chat_id, reply_token)
             return
         # Dynamic admin toggle commands
-        if action in ("toggle_tool", "toggle_skill"):
+        if action in ("toggle_tool", "toggle_skill", "self_toggle_tool", "self_toggle_skill"):
             name = params.get("name", "")
             command = f"/admin {action} {name}" if name else None
+        elif action == "self_reset":
+            command = "/admin self_reset"
+        elif action == "workspace_toggle":
+            value = params.get("value", "").lower()
+            command = f"/admin workspace {value}" if value in ("on", "off", "reset") else None
         else:
             command = action_map.get(action)
         if not command:

@@ -18,6 +18,7 @@ from nanobot.agent.access import AccessManager
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryStore, extract_memorize_tags
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tools.context import current_sender
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
@@ -119,6 +120,7 @@ class AgentLoop:
             web_proxy=web_proxy,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
+            access=self.access,
         )
 
         self._running = False
@@ -132,15 +134,34 @@ class AgentLoop:
         self._busy_sessions: set[str] = set()
         self._register_default_tools()
 
+    def _is_call_restricted(self) -> bool:
+        """Resolve workspace restriction for the in-flight tool call.
+
+        Reads the active sender_id from :data:`current_sender` and consults the
+        :class:`AccessManager` (if present). Falls back to the static config flag
+        when no access manager is configured or no sender is in scope.
+        """
+        if self.access is None:
+            return self.restrict_to_workspace
+        return self.access.is_workspace_restricted(
+            current_sender.get(), default=self.restrict_to_workspace
+        )
+
+    def _allowed_dir_for_call(self) -> Path | None:
+        return self.workspace if self._is_call_restricted() else None
+
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
-        allowed_dir = self.workspace if self.restrict_to_workspace else None
         for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
-            self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
+            self.tools.register(cls(
+                workspace=self.workspace,
+                allowed_dir_resolver=self._allowed_dir_for_call,
+            ))
         self.tools.register(ExecTool(
             working_dir=str(self.workspace),
             timeout=self.exec_config.timeout,
             restrict_to_workspace=self.restrict_to_workspace,
+            restrict_resolver=self._is_call_restricted,
             path_append=self.exec_config.path_append,
             python_via_uv=self.exec_config.python_via_uv,
         ))
@@ -197,12 +218,24 @@ class AgentLoop:
         finally:
             self._mcp_connecting = False
 
-    def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    def _set_tool_context(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        sender_id: str | None = None,
+    ) -> None:
         """Update context for all tools that need routing info."""
         for name in ("message", "spawn", "cron"):
             if tool := self.tools.get(name):
-                if hasattr(tool, "set_context"):
-                    tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+                if not hasattr(tool, "set_context"):
+                    continue
+                if name == "message":
+                    tool.set_context(channel, chat_id, message_id)
+                elif name == "spawn":
+                    tool.set_context(channel, chat_id, sender_id)
+                else:
+                    tool.set_context(channel, chat_id)
         # File tools need session_key
         session_key = f"{channel}:{chat_id}"
         for name in ("get_file_info", "analyze_file"):
@@ -236,6 +269,7 @@ class AgentLoop:
         model: str | None = None,
         allowed_tools: list[str] | None = None,
         on_busy: Callable[[], Awaitable[None]] | None = None,
+        sender_id: str | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
         messages = initial_messages
@@ -306,7 +340,9 @@ class AgentLoop:
                     if allowed_tools is not None and tool_call.name not in allowed_tools:
                         result = f"Error: Tool '{tool_call.name}' is not permitted for this user."
                     else:
-                        result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                        result = await self.tools.execute(
+                            tool_call.name, tool_call.arguments, sender_id=sender_id
+                        )
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -558,14 +594,16 @@ class AgentLoop:
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"), msg.sender_id)
             history = await self._get_history(key, session)
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 sender_id=msg.sender_id,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(messages, use_tools=True)
+            final_content, _, all_msgs = await self._run_agent_loop(
+                messages, use_tools=True, sender_id=msg.sender_id,
+            )
             await self._save_turn_to_storage(key, session, all_msgs, 1 + len(history))
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
@@ -639,7 +677,10 @@ class AgentLoop:
                 "/tool - Toggle tool mode\n"
                 "/stop - Stop the current task\n"
                 "/admin <passphrase> - Authenticate as admin\n"
-                "/admin panel - Show permissions panel\n"
+                "/admin panel - Show permissions panel (workspace + your + normal-user)\n"
+                "/admin workspace on|off|reset - Set/clear workspace restriction (caller only)\n"
+                "/admin self_toggle_tool|self_toggle_skill <name> - Restrict your own tools/skills\n"
+                "/admin self_reset - Clear your tool/skill self-restrictions\n"
                 "/help - Show available commands\n"
                 "! prefix - One-shot tool mode"
             )
@@ -723,7 +764,7 @@ class AgentLoop:
                     # Image: build multimodal message and send to LLM directly
                     user_text = msg.content.strip() or processed_text
                     history = await self._get_history(key, session)
-                    self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+                    self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"), msg.sender_id)
                     runtime_ctx = ContextBuilder._build_runtime_context(msg.channel, msg.chat_id)
                     user_content = [{"type": "text", "text": runtime_ctx}] + media_content + [{"type": "text", "text": user_text}]
                     initial_messages = [
@@ -742,6 +783,7 @@ class AgentLoop:
                         ))
                     final_content, _, all_msgs = await self._run_agent_loop(
                         initial_messages, on_progress=_bus_progress_img, use_tools=False,
+                        sender_id=msg.sender_id,
                     )
                     if final_content is None:
                         final_content = "I've completed processing but have no response to give."
@@ -777,7 +819,7 @@ class AgentLoop:
         allowed_tools = self.access.get_allowed_tools(msg.sender_id) if self.access else None
         allowed_skills = self.access.get_allowed_skills(msg.sender_id) if self.access else None
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"), msg.sender_id)
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
@@ -826,7 +868,7 @@ class AgentLoop:
             # Pass 1: free model, no tools, lightweight prompt
             final_content, _, all_msgs = await self._run_agent_loop(
                 initial_messages, on_progress=progress_cb, use_tools=False, model=self.model,
-                on_busy=busy_cb,
+                on_busy=busy_cb, sender_id=msg.sender_id,
             )
             # Check for escalation trigger
             if final_content:
@@ -849,12 +891,14 @@ class AgentLoop:
                         use_tools=True, model=self.tool_model,
                         allowed_tools=allowed_tools,
                         on_busy=busy_cb,
+                        sender_id=msg.sender_id,
                     )
         else:
             final_content, _, all_msgs = await self._run_agent_loop(
                 initial_messages, on_progress=progress_cb,
                 use_tools=use_tools, model=active_model,
                 allowed_tools=allowed_tools if use_tools else None,
+                sender_id=msg.sender_id,
                 on_busy=busy_cb,
             )
 
@@ -993,7 +1037,11 @@ class AgentLoop:
         arg = parts[2] if len(parts) > 2 else ""
 
         # /admin <passphrase> — anyone can attempt authentication
-        if sub and sub not in ("panel", "toggle_tool", "toggle_skill", "passphrase", "revoke"):
+        admin_subcommands = (
+            "panel", "toggle_tool", "toggle_skill", "passphrase", "revoke", "workspace",
+            "self_toggle_tool", "self_toggle_skill", "self_reset",
+        )
+        if sub and sub not in admin_subcommands:
             ok = self.access.authenticate(msg.sender_id, sub)
             status = "Authenticated as admin." if ok else "Invalid passphrase."
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
@@ -1010,16 +1058,48 @@ class AgentLoop:
             all_skills = [s["name"] for s in self.context.skills.list_skills()]
             allowed_tools = self.access.get_allowed_tools("__normal__") or []
             allowed_skills = self.access.get_allowed_skills("__normal__") or []
-            lines = ["**Admin Panel — Normal User Permissions**\n"]
-            lines.append("**Tools:**")
+            self_tools = self.access.get_admin_self_tools(msg.sender_id)
+            self_skills = self.access.get_admin_self_skills(msg.sender_id)
+            workspace_restricted = self.access.is_workspace_restricted(
+                msg.sender_id, default=self.restrict_to_workspace
+            )
+            workspace_override = self.access.get_workspace_override(msg.sender_id)
+
+            lines = ["**Admin Panel**\n"]
+            lines.append("**Your Workspace:** "
+                         + ("RESTRICTED to workspace dir" if workspace_restricted
+                            else "UNRESTRICTED (full filesystem + shell)"))
+            lines.append("  Use `/admin workspace on|off`")
+
+            lines.append("\n**Your Tools:** "
+                         + ("custom allowlist" if self_tools is not None else "all enabled (no self-restriction)"))
+            for t in all_tools:
+                if self_tools is None:
+                    icon = "ON"
+                else:
+                    icon = "ON" if t in self_tools else "OFF"
+                lines.append(f"  {icon} `{t}`")
+            lines.append("  Use `/admin self_toggle_tool <name>` (initializes allowlist on first toggle)")
+
+            lines.append("\n**Your Skills:** "
+                         + ("custom allowlist" if self_skills is not None else "all enabled (no self-restriction)"))
+            for s in all_skills:
+                if self_skills is None:
+                    icon = "ON"
+                else:
+                    icon = "ON" if s in self_skills else "OFF"
+                lines.append(f"  {icon} `{s}`")
+            lines.append("  Use `/admin self_toggle_skill <name>` · `/admin self_reset` to clear")
+
+            lines.append("\n**Normal User Tools:**")
             for t in all_tools:
                 icon = "ON" if t in allowed_tools else "OFF"
                 lines.append(f"  {icon} `{t}`")
-            lines.append("\n**Skills:**")
+            lines.append("\n**Normal User Skills:**")
             for s in all_skills:
                 icon = "ON" if s in allowed_skills else "OFF"
                 lines.append(f"  {icon} `{s}`")
-            lines.append(f"\nUse `/admin toggle_tool <name>` or `/admin toggle_skill <name>` to change.")
+            lines.append("  Use `/admin toggle_tool <name>` · `/admin toggle_skill <name>`")
             content = "\n".join(lines)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content=content,
@@ -1028,6 +1108,11 @@ class AgentLoop:
                                             "skills": all_skills,
                                             "allowed_tools": allowed_tools,
                                             "allowed_skills": allowed_skills,
+                                            "self_allowed_tools": self_tools,
+                                            "self_allowed_skills": self_skills,
+                                            "workspace_restricted": workspace_restricted,
+                                            "workspace_override": workspace_override,
+                                            "workspace_default": self.restrict_to_workspace,
                                             **(msg.metadata or {})})
 
         if sub == "toggle_tool":
@@ -1048,6 +1133,40 @@ class AgentLoop:
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content=f"Skill `{arg}` for normal users: {status}")
 
+        if sub == "self_toggle_tool":
+            if not arg:
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="Usage: /admin self_toggle_tool <name>")
+            if arg not in self.tools.tool_names:
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content=f"Unknown tool `{arg}`. See `/admin panel`.")
+            new_state = self.access.toggle_admin_self_tool(
+                msg.sender_id, arg, self.tools.tool_names
+            )
+            status = "ON" if new_state else "OFF"
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content=f"Tool `{arg}` for you: {status}")
+
+        if sub == "self_toggle_skill":
+            if not arg:
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="Usage: /admin self_toggle_skill <name>")
+            all_skills = [s["name"] for s in self.context.skills.list_skills()]
+            if arg not in all_skills:
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content=f"Unknown skill `{arg}`. See `/admin panel`.")
+            new_state = self.access.toggle_admin_self_skill(
+                msg.sender_id, arg, all_skills
+            )
+            status = "ON" if new_state else "OFF"
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content=f"Skill `{arg}` for you: {status}")
+
+        if sub == "self_reset":
+            self.access.clear_admin_self(msg.sender_id)
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content="Your tool/skill self-restrictions cleared. All enabled.")
+
         if sub == "passphrase":
             if not arg:
                 return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
@@ -1063,8 +1182,53 @@ class AgentLoop:
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content=status)
 
+        if sub == "workspace":
+            choice = arg.lower().strip()
+            if choice in ("off", "false", "unrestrict", "0", "no"):
+                self.access.set_workspace_override(msg.sender_id, False)
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content="Workspace restriction OFF for your sessions. "
+                            "You now have full filesystem and shell access. Other users remain restricted.",
+                )
+            if choice in ("on", "true", "restrict", "1", "yes"):
+                self.access.set_workspace_override(msg.sender_id, True)
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content="Workspace restriction ON for your sessions. "
+                            "You're now scoped to the workspace dir.",
+                )
+            if choice in ("reset", "default", "clear"):
+                self.access.set_workspace_override(msg.sender_id, None)
+                default_state = "restricted" if self.restrict_to_workspace else "unrestricted"
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content=f"Workspace override cleared. Reverting to config default ({default_state}).",
+                )
+            if choice in ("", "status"):
+                restricted = self.access.is_workspace_restricted(
+                    msg.sender_id, default=self.restrict_to_workspace
+                )
+                override = self.access.get_workspace_override(msg.sender_id)
+                state = "restricted" if restricted else "unrestricted"
+                source = (
+                    "explicit override" if override is not None
+                    else f"config default ({'restricted' if self.restrict_to_workspace else 'unrestricted'})"
+                )
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content=f"Your workspace state: {state} (from {source}). "
+                            "Use `/admin workspace on|off|reset`.",
+                )
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Usage: /admin workspace on|off|reset|status",
+            )
+
         return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                              content="Unknown /admin subcommand. Try: panel, toggle_tool, toggle_skill, passphrase, revoke")
+                              content="Unknown /admin subcommand. Try: panel, toggle_tool, toggle_skill, "
+                                      "self_toggle_tool, self_toggle_skill, self_reset, "
+                                      "passphrase, revoke, workspace")
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
         """Save user messages and final assistant reply into session.

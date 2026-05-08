@@ -3,6 +3,7 @@
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.context import current_sender
 
 
 class ToolRegistry:
@@ -43,14 +44,22 @@ class ToolRegistry:
         ]
         return [tool.to_schema() for tool in tools]
 
-    async def execute(self, name: str, params: dict[str, Any]) -> str:
-        """Execute a tool by name with given parameters."""
+    async def execute(
+        self, name: str, params: dict[str, Any], sender_id: str | None = None
+    ) -> str:
+        """Execute a tool by name with given parameters.
+
+        *sender_id* is published via :data:`current_sender` so tools can resolve
+        per-caller policy (e.g. workspace-restriction overrides). It is reset
+        after execution.
+        """
         _HINT = "\n\n[Analyze the error above and try a different approach.]"
 
         tool = self._tools.get(name)
         if not tool:
             return f"Error: Tool '{name}' not found. Available: {', '.join(self.tool_names)}"
 
+        token = current_sender.set(sender_id)
         try:
             errors = tool.validate_params(params)
             if errors:
@@ -61,6 +70,8 @@ class ToolRegistry:
             return result
         except Exception as e:
             return f"Error executing {name}: {str(e)}" + _HINT
+        finally:
+            current_sender.reset(token)
 
     @property
     def tool_names(self) -> list[str]:

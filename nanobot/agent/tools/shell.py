@@ -4,6 +4,7 @@ import asyncio
 import os
 import re
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ class ExecTool(Tool):
         restrict_to_workspace: bool = False,
         path_append: str = "",
         python_via_uv: bool = True,
+        restrict_resolver: Callable[[], bool] | None = None,
     ):
         self.timeout = timeout
         self.working_dir = working_dir
@@ -46,6 +48,7 @@ class ExecTool(Tool):
         ]
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
+        self._restrict_resolver = restrict_resolver
         self.path_append = path_append
         self.python_via_uv = python_via_uv
         self._powershell: str | None = None
@@ -223,6 +226,11 @@ class ExecTool(Tool):
         rest = segment[m.end():]
         return f"{leading}{replacement}{trailing}{rest}"
 
+    def _effective_restrict(self) -> bool:
+        if self._restrict_resolver is not None:
+            return bool(self._restrict_resolver())
+        return self.restrict_to_workspace
+
     def _guard_command(self, command: str, cwd: str) -> str | None:
         """Best-effort safety guard for potentially destructive commands."""
         cmd = command.strip()
@@ -236,7 +244,7 @@ class ExecTool(Tool):
             if not any(re.search(p, lower) for p in self.allow_patterns):
                 return "Error: Command blocked by safety guard (not in allowlist)"
 
-        if self.restrict_to_workspace:
+        if self._effective_restrict():
             if "..\\" in cmd or "../" in cmd:
                 return "Error: Command blocked by safety guard (path traversal detected)"
 
