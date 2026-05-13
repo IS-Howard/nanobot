@@ -665,11 +665,13 @@ class LineChannel(BaseChannel):
             logger.warning("LINE client not running")
             return
 
-        # Any outbound message means the agent is no longer silent — drop the stub.
-        self._cancel_processing_stub(msg.chat_id)
-
         is_progress = msg.metadata.get("_progress", False)
+        # A real (non-progress) outbound means the agent is no longer silent —
+        # drop the stub. Progress chunks are queued (not pushed) so they're
+        # invisible to the user; cancelling the stub on them would silently
+        # kill the only path to a tappable Continue button.
         if not is_progress:
+            self._cancel_processing_stub(msg.chat_id)
             self._cancel_loading(msg.chat_id)
         messages: list[dict[str, Any]] = []
 
@@ -730,15 +732,17 @@ class LineChannel(BaseChannel):
         if not messages:
             return
 
-        # Try reply API first (free)
-        token_entry = self._reply_tokens.pop(msg.chat_id, None)
-        if token_entry and not is_progress:
-            token, ts = token_entry
-            if time.monotonic() - ts < LINE_REPLY_TOKEN_TTL:
-                first_batch = messages[:LINE_MAX_MESSAGES_PER_PUSH]
-                replied = await self._reply_messages(token, first_batch)
-                if replied:
-                    messages = messages[LINE_MAX_MESSAGES_PER_PUSH:]
+        # Try reply API first (free). Progress chunks don't consume the token —
+        # leave it for the eventual real reply.
+        if not is_progress:
+            token_entry = self._reply_tokens.pop(msg.chat_id, None)
+            if token_entry:
+                token, ts = token_entry
+                if time.monotonic() - ts < LINE_REPLY_TOKEN_TTL:
+                    first_batch = messages[:LINE_MAX_MESSAGES_PER_PUSH]
+                    replied = await self._reply_messages(token, first_batch)
+                    if replied:
+                        messages = messages[LINE_MAX_MESSAGES_PER_PUSH:]
 
         # Queue any remaining messages for user retrieval via "." / Continue
         if messages:
@@ -897,7 +901,9 @@ class LineChannel(BaseChannel):
         if action == "skip_transcribe":
             return
 
-        # Handle "continue" postback — flush queued messages
+        # Handle "continue" postback — flush queued messages, or extend the
+        # reply-token window when the agent is still mid-flight with nothing
+        # queued yet (Continue acts as a loading-window extender).
         if action == "continue":
             source = event.get("source", {})
             sender_id = source.get("userId", "")
@@ -908,8 +914,22 @@ class LineChannel(BaseChannel):
                 chat_id = source.get("roomId", sender_id)
             else:
                 chat_id = sender_id
+            if source_type:
+                self._chat_source_types[chat_id] = source_type
             reply_token = event.get("replyToken", "")
-            await self._flush_queue(chat_id, reply_token)
+            flushed = await self._flush_queue(chat_id, reply_token)
+            # Empty queue + agent still busy: retain the fresh token so the
+            # eventual agent response uses the reply API, and re-arm the
+            # processing stub so the user can tap Continue again before this
+            # new token expires.
+            if not flushed and reply_token and chat_id in self._loading_tasks:
+                self._reply_tokens[chat_id] = (reply_token, time.monotonic())
+                self._schedule_processing_stub(chat_id)
+                # Bring back the loading dots immediately. The stub at t=18s
+                # had pushed a real message which made LINE drop the dots,
+                # and the keep-alive timer won't tick again for ~25s — that
+                # would leave a visible silent gap right after the user taps.
+                asyncio.create_task(self._show_loading(chat_id))
             return
         # Dynamic admin toggle commands
         if action in ("toggle_tool", "toggle_skill", "self_toggle_tool", "self_toggle_skill"):

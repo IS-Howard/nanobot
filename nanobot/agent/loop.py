@@ -689,6 +689,10 @@ class AgentLoop:
 
         _attach_mode = False  # True when processing attached file content
 
+        # Detect tool-mode indicators on the ORIGINAL user content before any
+        # attachment wrapper buries the `!` prefix mid-string.
+        use_tools, content = self._should_use_tools(key, msg.content, sender_id=msg.sender_id)
+
         # Stash media when messages arrive (latest file only), don't send to LLM
         if msg.media:
             path = msg.media[-1]
@@ -761,12 +765,15 @@ class AgentLoop:
             if pending:
                 processed_text, media_content = await self._process_attachment(pending)
                 if media_content is not None:
-                    # Image: build multimodal message and send to LLM directly
-                    user_text = msg.content.strip() or processed_text
+                    # Image: build multimodal message and send to LLM directly.
+                    # Use cleaned `content` (no `!` prefix) so the vision model
+                    # doesn't see the tool-mode marker.
+                    user_text = content.strip() or processed_text
                     history = await self._get_history(key, session)
                     self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"), msg.sender_id)
                     runtime_ctx = ContextBuilder._build_runtime_context(msg.channel, msg.chat_id)
                     user_content = [{"type": "text", "text": runtime_ctx}] + media_content + [{"type": "text", "text": user_text}]
+                    allowed_tools = self.access.get_allowed_tools(msg.sender_id) if self.access else None
                     initial_messages = [
                         {"role": "system", "content": self.context.build_system_prompt(
                             sender_id=msg.sender_id,
@@ -781,8 +788,11 @@ class AgentLoop:
                         await self.bus.publish_outbound(OutboundMessage(
                             channel=msg.channel, chat_id=msg.chat_id, content=text, metadata=meta,
                         ))
+                    img_model = self.tool_model if use_tools and self.tool_model else self.model
                     final_content, _, all_msgs = await self._run_agent_loop(
-                        initial_messages, on_progress=_bus_progress_img, use_tools=False,
+                        initial_messages, on_progress=_bus_progress_img,
+                        use_tools=use_tools, model=img_model,
+                        allowed_tools=allowed_tools if use_tools else None,
                         sender_id=msg.sender_id,
                     )
                     if final_content is None:
@@ -801,19 +811,20 @@ class AgentLoop:
                     )
                 else:
                     # Non-image: prepend processed text to user's message
-                    # Wrap in XML tags so the LLM treats it as data, not instructions
+                    # Wrap in XML tags so the LLM treats it as data, not instructions.
+                    # Use `content` (already stripped of any `!` prefix) so the
+                    # tool-mode marker isn't echoed back to the LLM as text.
                     msg = InboundMessage(
                         channel=msg.channel, sender_id=msg.sender_id, chat_id=msg.chat_id,
-                        content=f"<attached_file>\n{processed_text}\n</attached_file>\n\nUser request: {msg.content}",
+                        content=f"<attached_file>\n{processed_text}\n</attached_file>\n\nUser request: {content}",
                         timestamp=msg.timestamp, metadata=msg.metadata,
                         session_key_override=msg.session_key_override,
                     )
+                    content = msg.content
                     _attach_mode = True
 
-        # Determine tool usage (disabled for attach mode — file content is untrusted)
-        use_tools, content = self._should_use_tools(key, msg.content, sender_id=msg.sender_id)
-        if _attach_mode:
-            use_tools = False
+        # `use_tools` and `content` were already resolved above (before any
+        # attachment rewrap) so `!` prefix works regardless of attach mode.
 
         # Resolve access-control filtered tool/skill lists
         allowed_tools = self.access.get_allowed_tools(msg.sender_id) if self.access else None
