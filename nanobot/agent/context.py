@@ -22,13 +22,6 @@ class ContextBuilder:
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
 
-    _ESCALATION_PROMPT = """\
-## Tool Escalation
-You have access to tools (web search, file read/write, shell exec, etc.) but they require \
-switching to a more capable model. If the user's request would benefit from using tools, \
-respond ONLY with: <need_tools>brief reason why tools are needed</need_tools>
-Otherwise, answer directly."""
-
     _MEMORIZE_INSTRUCTIONS = """\
 ## Memory Management
 
@@ -51,7 +44,6 @@ Keep each fact concise — one clear statement per tag."""
         self,
         skill_names: list[str] | None = None,
         include_skills: bool = True,
-        include_escalation: bool = False,
         include_memory: bool = True,
         sender_id: str | None = None,
         allowed_skills: list[str] | None = None,
@@ -87,9 +79,6 @@ The following skills extend your capabilities. To use a skill, read its SKILL.md
 Skills with available="false" need dependencies installed first - you can try installing them with apt/brew.
 
 {skills_summary}""")
-
-        if include_escalation:
-            parts.append(self._ESCALATION_PROMPT)
 
         return "\n\n---\n\n".join(parts)
 
@@ -151,7 +140,6 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         channel: str | None = None,
         chat_id: str | None = None,
         include_skills: bool = True,
-        include_escalation: bool = False,
         sender_id: str | None = None,
         allowed_skills: list[str] | None = None,
     ) -> list[dict[str, Any]]:
@@ -169,7 +157,6 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         return [
             {"role": "system", "content": self.build_system_prompt(
                 skill_names, include_skills=include_skills,
-                include_escalation=include_escalation,
                 sender_id=sender_id,
                 allowed_skills=allowed_skills,
             )},

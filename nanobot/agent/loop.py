@@ -32,7 +32,7 @@ from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig
+    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, TranscriptionConfig
     from nanobot.cron.service import CronService
     from nanobot.storage.postgres import PostgresStorage
 
@@ -51,17 +51,12 @@ class AgentLoop:
 
     _TOOL_RESULT_MAX_CHARS = 2000
 
-    _NEED_TOOLS_RE = re.compile(r"<need_tools>(.*?)</need_tools>", re.DOTALL)
-
     def __init__(
         self,
         bus: MessageBus,
         provider: LLMProvider,
         workspace: Path,
         model: str | None = None,
-        tool_model: str = "",
-        tool_provider: LLMProvider | None = None,
-        auto_escalate: bool = True,
         max_iterations: int = 40,
         temperature: float = 0.1,
         max_tokens: int = 4096,
@@ -76,10 +71,11 @@ class AgentLoop:
         storage: PostgresStorage | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        transcription_config: "TranscriptionConfig | None" = None,
         parallel: bool = False,
         access: AccessManager | None = None,
     ):
-        from nanobot.config.schema import ExecToolConfig
+        from nanobot.config.schema import ExecToolConfig, TranscriptionConfig
         self.access = access
         self.bus = bus
         self.parallel = parallel
@@ -87,9 +83,6 @@ class AgentLoop:
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
-        self.tool_model = tool_model
-        self.tool_provider = tool_provider
-        self.auto_escalate = auto_escalate
         self.max_iterations = max_iterations
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -98,6 +91,7 @@ class AgentLoop:
         self.brave_api_key = brave_api_key
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
+        self.transcription_config = transcription_config or TranscriptionConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
 
@@ -105,7 +99,6 @@ class AgentLoop:
         self.sessions = session_manager or SessionManager(workspace)
         self.storage = storage
         self.tools = ToolRegistry()
-        self._tool_mode: dict[str, bool] = {}  # session_key -> persistent tool mode
         self._pending_media: dict[str, dict[str, str]] = {}  # session_key -> {path, mime}
         self._attach_next: dict[str, bool] = {}  # session_key -> True when /a was sent
         self.subagents = SubagentManager(
@@ -178,21 +171,11 @@ class AgentLoop:
         if self.storage:
             from nanobot.agent.tools.files import FileAnalysisTool, FileInfoTool
             self.tools.register(FileInfoTool(storage=self.storage))
-            analysis_provider = self.tool_provider or self.provider
-            analysis_model = self.tool_model or self.model
-            transcription = None
-            try:
-                import os
-                groq_key = os.environ.get("GROQ_API_KEY")
-                if groq_key:
-                    from nanobot.providers.transcription import GroqTranscriptionProvider
-                    transcription = GroqTranscriptionProvider(api_key=groq_key)
-            except ImportError:
-                pass
+            transcription = self._get_transcription()
             self.tools.register(FileAnalysisTool(
                 storage=self.storage,
-                provider=analysis_provider,
-                model=analysis_model,
+                provider=self.provider,
+                model=self.model,
                 transcription=transcription,
             ))
 
@@ -277,9 +260,10 @@ class AgentLoop:
         final_content = None
         tools_used: list[str] = []
         active_model = model or self.model
-        # Use tool_provider when switching to tool_model (may need different provider type)
-        active_provider = (self.tool_provider or self.provider) if (model and model == self.tool_model and self.tool_provider) else self.provider
-        tool_defs = self.tools.get_definitions(allowed=allowed_tools) if use_tools else None
+        # An empty allowlist (e.g. a normal user with no granted tools) yields
+        # no definitions — pass None so we don't send an empty tools array to
+        # the provider, which effectively runs a pure conversational turn.
+        tool_defs = (self.tools.get_definitions(allowed=allowed_tools) or None) if use_tools else None
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -299,7 +283,7 @@ class AgentLoop:
             )
             logger.info("LLM request: ~{} chars, {} messages ({})", msg_chars, len(messages), active_model)
 
-            response = await active_provider.chat(
+            response = await self.provider.chat(
                 messages=messages,
                 tools=tool_defs,
                 model=active_model,
@@ -565,21 +549,6 @@ class AgentLoop:
             if new_msgs:
                 await self.storage.save_messages(key, new_msgs)
 
-    def _should_use_tools(self, key: str, content: str, sender_id: str | None = None) -> tuple[bool, str]:
-        """Determine if tools should be used. Returns (use_tools, cleaned_content)."""
-        # Non-admins cannot manually activate tool mode (strip ! prefix so LLM sees clean text)
-        if sender_id and self.access and not self.access.is_admin(sender_id):
-            if content.startswith("!") and len(content) > 1:
-                content = content[1:].strip()
-            return False, content
-        # Persistent tool mode
-        if self._tool_mode.get(key, False):
-            return True, content
-        # One-shot tool mode with ! prefix
-        if content.startswith("!") and len(content) > 1:
-            return True, content[1:].strip()
-        return False, content
-
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -652,46 +621,33 @@ class AgentLoop:
                 logger.exception("Cleanup failed for {}", session.key)
                 return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                       content="Cleanup failed. Please try again.")
-        if cmd == "/tool":
-            # Non-admins cannot toggle tool mode
-            if self.access and not self.access.is_admin(msg.sender_id):
-                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                      content="Access denied. Only admins can toggle tool mode.")
-            self._tool_mode[key] = not self._tool_mode.get(key, False)
-            mode = "ON" if self._tool_mode[key] else "OFF"
-            model_info = f" (model: {self.tool_model or self.model})" if self._tool_mode[key] else ""
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content=f"Tool mode {mode}{model_info}")
-
         # /admin commands
         if cmd.startswith("/admin") and self.access:
             return self._handle_admin_command(msg)
 
         if cmd == "/help":
-            help_text = (
-                "nanobot commands:\n"
-                "/new - Start a new conversation\n"
-                "/a - Process attached file (image/audio/text/PDF)\n"
-                "/consolidate [topic] - Save conversation to memory (optionally focused on a topic)\n"
-                "/cleanup - Compact and deduplicate memory files\n"
-                "/tool - Toggle tool mode\n"
-                "/stop - Stop the current task\n"
-                "/admin <passphrase> - Authenticate as admin\n"
-                "/admin panel - Show permissions panel (workspace + your + normal-user)\n"
-                "/admin workspace on|off|reset - Set/clear workspace restriction (caller only)\n"
-                "/admin self_toggle_tool|self_toggle_skill <name> - Restrict your own tools/skills\n"
-                "/admin self_reset - Clear your tool/skill self-restrictions\n"
-                "/help - Show available commands\n"
-                "! prefix - One-shot tool mode"
-            )
+            is_admin = bool(self.access and self.access.is_admin(msg.sender_id))
+            lines = [
+                "nanobot commands:",
+                "/new - New conversation",
+                "/a - Process attachment",
+                "/consolidate [topic] - Save memory",
+                "/cleanup - Clean memory",
+                "/stop - Stop current task",
+                "/help - Show commands",
+            ]
+            if is_admin:
+                lines.extend([
+                    "/admin panel - Permissions panel",
+                    "/admin workspace on|off|reset - Workspace scope",
+                    "/admin self_reset - Clear self-restrictions",
+                ])
+            help_text = "\n".join(lines)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content=help_text)
 
         _attach_mode = False  # True when processing attached file content
-
-        # Detect tool-mode indicators on the ORIGINAL user content before any
-        # attachment wrapper buries the `!` prefix mid-string.
-        use_tools, content = self._should_use_tools(key, msg.content, sender_id=msg.sender_id)
+        content = msg.content
 
         # Stash media when messages arrive (latest file only), don't send to LLM
         if msg.media:
@@ -731,9 +687,12 @@ class AgentLoop:
             transcriber = self._get_transcription()
             if not transcriber:
                 return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                      content="Transcription unavailable (GROQ_API_KEY not set).")
+                                      content=self._transcription_unavailable_msg())
             try:
                 logger.info("/transcribe: transcribing {}...", p.name)
+                # Transcription can be slow (large models / long audio); show the
+                # channel's busy "…" indicator and keep-alive just like a chat turn.
+                await self._send_busy_notification(msg)
                 transcript = await transcriber.transcribe(pending["path"])
                 if transcript:
                     txt_path.write_text(transcript, encoding="utf-8")
@@ -763,11 +722,14 @@ class AgentLoop:
         if self._attach_next.pop(key, False):
             pending = self._pending_media.get(key)
             if pending:
+                # Audio transcription / PDF extraction can be slow — surface the
+                # channel's busy "…" indicator before processing the attachment.
+                pmime = pending.get("mime", "")
+                if pmime.startswith("audio/") or pmime == "application/pdf":
+                    await self._send_busy_notification(msg)
                 processed_text, media_content = await self._process_attachment(pending)
                 if media_content is not None:
                     # Image: build multimodal message and send to LLM directly.
-                    # Use cleaned `content` (no `!` prefix) so the vision model
-                    # doesn't see the tool-mode marker.
                     user_text = content.strip() or processed_text
                     history = await self._get_history(key, session)
                     self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"), msg.sender_id)
@@ -788,11 +750,10 @@ class AgentLoop:
                         await self.bus.publish_outbound(OutboundMessage(
                             channel=msg.channel, chat_id=msg.chat_id, content=text, metadata=meta,
                         ))
-                    img_model = self.tool_model if use_tools and self.tool_model else self.model
                     final_content, _, all_msgs = await self._run_agent_loop(
                         initial_messages, on_progress=_bus_progress_img,
-                        use_tools=use_tools, model=img_model,
-                        allowed_tools=allowed_tools if use_tools else None,
+                        model=self.model,
+                        allowed_tools=allowed_tools,
                         sender_id=msg.sender_id,
                     )
                     if final_content is None:
@@ -812,8 +773,6 @@ class AgentLoop:
                 else:
                     # Non-image: prepend processed text to user's message
                     # Wrap in XML tags so the LLM treats it as data, not instructions.
-                    # Use `content` (already stripped of any `!` prefix) so the
-                    # tool-mode marker isn't echoed back to the LLM as text.
                     msg = InboundMessage(
                         channel=msg.channel, sender_id=msg.sender_id, chat_id=msg.chat_id,
                         content=f"<attached_file>\n{processed_text}\n</attached_file>\n\nUser request: {content}",
@@ -823,10 +782,7 @@ class AgentLoop:
                     content = msg.content
                     _attach_mode = True
 
-        # `use_tools` and `content` were already resolved above (before any
-        # attachment rewrap) so `!` prefix works regardless of attach mode.
-
-        # Resolve access-control filtered tool/skill lists
+        # Resolve access-control filtered tool/skill lists (None = all allowed)
         allowed_tools = self.access.get_allowed_tools(msg.sender_id) if self.access else None
         allowed_skills = self.access.get_allowed_skills(msg.sender_id) if self.access else None
 
@@ -837,24 +793,12 @@ class AgentLoop:
 
         history = await self._get_history(key, session)
 
-        # Choose model based on tool mode
-        if use_tools and self.tool_model:
-            active_model = self.tool_model
-        else:
-            active_model = self.model
-
-        # Determine prompt flags based on tool usage
-        can_escalate = not use_tools and bool(self.tool_model) and self.auto_escalate
-        include_skills = use_tools
-        include_escalation = can_escalate
-
         initial_messages = self.context.build_messages(
             history=history,
             current_message=content,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
-            include_skills=include_skills,
-            include_escalation=include_escalation,
+            include_skills=True,
             sender_id=msg.sender_id,
             allowed_skills=allowed_skills,
         )
@@ -874,44 +818,13 @@ class AgentLoop:
 
         busy_cb = _refresh_busy if msg.channel != "cli" else None
 
-        # Auto-escalation: free model detects tool need -> switch to tool model
-        if can_escalate:
-            # Pass 1: free model, no tools, lightweight prompt
-            final_content, _, all_msgs = await self._run_agent_loop(
-                initial_messages, on_progress=progress_cb, use_tools=False, model=self.model,
-                on_busy=busy_cb, sender_id=msg.sender_id,
-            )
-            # Check for escalation trigger
-            if final_content:
-                match = self._NEED_TOOLS_RE.search(final_content)
-                if match:
-                    reason = match.group(1).strip()
-                    logger.info("Auto-escalating to tool model: {}", reason)
-                    # Pass 2: tool model with FC + skills (filtered for normal users)
-                    initial_messages = self.context.build_messages(
-                        history=history,
-                        current_message=content,
-                        media=msg.media if msg.media else None,
-                        channel=msg.channel, chat_id=msg.chat_id,
-                        include_skills=True, include_escalation=False,
-                        sender_id=msg.sender_id,
-                        allowed_skills=allowed_skills,
-                    )
-                    final_content, _, all_msgs = await self._run_agent_loop(
-                        initial_messages, on_progress=progress_cb,
-                        use_tools=True, model=self.tool_model,
-                        allowed_tools=allowed_tools,
-                        on_busy=busy_cb,
-                        sender_id=msg.sender_id,
-                    )
-        else:
-            final_content, _, all_msgs = await self._run_agent_loop(
-                initial_messages, on_progress=progress_cb,
-                use_tools=use_tools, model=active_model,
-                allowed_tools=allowed_tools if use_tools else None,
-                sender_id=msg.sender_id,
-                on_busy=busy_cb,
-            )
+        final_content, _, all_msgs = await self._run_agent_loop(
+            initial_messages, on_progress=progress_cb,
+            model=self.model,
+            allowed_tools=allowed_tools,
+            sender_id=msg.sender_id,
+            on_busy=busy_cb,
+        )
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
@@ -972,8 +885,8 @@ class AgentLoop:
                 return f"[Audio: {file_name}]\nTranscript:\n{transcript}", None
             transcriber = self._get_transcription()
             if not transcriber:
-                logger.warning("/a: GROQ_API_KEY not set, cannot transcribe")
-                return f"[Audio: {file_name}] Transcription unavailable (GROQ_API_KEY not set).", None
+                logger.warning("/a: no transcription backend available")
+                return f"[Audio: {file_name}] {self._transcription_unavailable_msg()}", None
             try:
                 logger.info("/a: transcribing audio...")
                 transcript = await transcriber.transcribe(path)
@@ -1032,12 +945,50 @@ class AgentLoop:
         return f"[File: {file_name}] ({mime}, {size_str}) — unsupported format for direct processing.", None
 
     def _get_transcription(self):
-        """Lazily create a GroqTranscriptionProvider if API key is available."""
-        key = os.environ.get("GROQ_API_KEY")
-        if not key:
-            return None
-        from nanobot.providers.transcription import GroqTranscriptionProvider
-        return GroqTranscriptionProvider(api_key=key)
+        """Create a transcription provider per config, with graceful fallback.
+
+        backend=local  → faster-whisper (offline), or None if not installed
+        backend=groq   → Groq Whisper API, or None if GROQ_API_KEY unset
+        backend=auto   → prefer local faster-whisper, else fall back to Groq
+        """
+        cfg = self.transcription_config
+        backend = (cfg.backend or "auto").strip().lower()
+
+        def make_local():
+            from nanobot.providers.transcription import FasterWhisperTranscriptionProvider
+            if not FasterWhisperTranscriptionProvider.is_available():
+                return None
+            return FasterWhisperTranscriptionProvider(
+                model=cfg.model,
+                device=cfg.device,
+                compute_type=cfg.compute_type,
+                language=cfg.language or None,
+                cpu_threads=cfg.cpu_threads,
+            )
+
+        def make_groq():
+            key = os.environ.get("GROQ_API_KEY")
+            if not key:
+                return None
+            from nanobot.providers.transcription import GroqTranscriptionProvider
+            return GroqTranscriptionProvider(api_key=key)
+
+        if backend in ("local", "faster-whisper", "faster_whisper", "whisper"):
+            return make_local()
+        if backend == "groq":
+            return make_groq()
+        # auto: local-first (offline, no key), then Groq
+        return make_local() or make_groq()
+
+    def _transcription_unavailable_msg(self) -> str:
+        """Backend-aware hint shown when no transcription provider is configured."""
+        backend = (self.transcription_config.backend or "auto").strip().lower()
+        if backend == "groq":
+            return "Transcription unavailable (set GROQ_API_KEY)."
+        if backend in ("local", "faster-whisper", "faster_whisper", "whisper"):
+            return "Transcription unavailable (install faster-whisper: pip install nanobot-ai[whisper])."
+        return ("Transcription unavailable — install faster-whisper for local transcription "
+                "(pip install nanobot-ai[whisper]) or set GROQ_API_KEY.")
 
     def _handle_admin_command(self, msg: InboundMessage) -> OutboundMessage:
         """Handle /admin slash commands."""

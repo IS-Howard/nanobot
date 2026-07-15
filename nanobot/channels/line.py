@@ -87,31 +87,6 @@ def _flex_transcribe_confirm(file_name: str) -> dict:
     }
 
 
-def _flex_tool_status(content: str) -> dict | None:
-    """Build Flex bubble for tool mode toggle response."""
-    # Parse "Tool mode ON (model: ...)" or "Tool mode OFF"
-    if not content.startswith("Tool mode "):
-        return None
-    is_on = "ON" in content
-    color = "#06C755" if is_on else "#999999"
-    status = "ON" if is_on else "OFF"
-    body_contents: list[dict] = [
-        {"type": "text", "text": "Tool Mode", "weight": "bold", "flex": 0, "size": "md"},
-        {"type": "text", "text": status, "color": color, "weight": "bold", "align": "end", "size": "md"},
-    ]
-    bubble: dict = {
-        "type": "bubble", "size": "kilo",
-        "body": {"type": "box", "layout": "horizontal", "contents": body_contents},
-    }
-    # Extract model info if present
-    if "(model: " in content:
-        model = content.split("(model: ", 1)[1].rstrip(")")
-        bubble["footer"] = {"type": "box", "layout": "vertical", "contents": [
-            {"type": "text", "text": model, "size": "xs", "color": "#999999"},
-        ]}
-    return {"type": "flex", "altText": content, "contents": bubble}
-
-
 def _flex_help(content: str) -> dict | None:
     """Build Flex bubble for help command response."""
     if not content.startswith("nanobot commands:"):
@@ -693,7 +668,7 @@ class LineChannel(BaseChannel):
                     workspace_default=msg.metadata.get("workspace_default", False),
                 )
             else:
-                flex_msg = _flex_tool_status(msg.content) or _flex_help(msg.content)
+                flex_msg = _flex_help(msg.content)
 
         # Switch Rich Menu when user authenticates as admin
         if msg.metadata.get("_admin_auth") and self._rich_menu_admin:
@@ -884,7 +859,6 @@ class LineChannel(BaseChannel):
         """Process a postback event (from Quick Reply and admin panel buttons)."""
         data = event.get("postback", {}).get("data", "")
         action_map = {
-            "tool": "/tool",
             "consolidate": "/consolidate",
             "cleanup": "/cleanup",
             "new": "/new",
@@ -963,6 +937,12 @@ class LineChannel(BaseChannel):
         reply_token = event.get("replyToken", "")
         if reply_token:
             self._reply_tokens[chat_id] = (reply_token, time.monotonic())
+            # Postback-triggered commands can be slow (e.g. "transcribe"). Arm the
+            # processing stub — same as the text path — so a "⏳ Processing…" message
+            # with a Continue button appears before the reply token expires, letting
+            # the user retrieve the result once it's ready. Instant commands respond
+            # first and cancel the stub, so this is harmless for them.
+            self._schedule_processing_stub(chat_id)
 
         await self._handle_message(
             sender_id=sender_id,

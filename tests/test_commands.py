@@ -92,7 +92,5 @@ def test_find_by_model_nvidia():
 
 def test_config_defaults():
     config = Config()
-    assert config.agents.defaults.tool_model == ""
-    assert config.agents.defaults.auto_escalate is True
     assert config.agents.defaults.max_context_items == 20
     assert config.database.url == ""

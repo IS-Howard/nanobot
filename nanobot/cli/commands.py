@@ -1,6 +1,7 @@
 """CLI commands for nanobot."""
 
 import asyncio
+import os
 import select
 import signal
 import sys
@@ -229,22 +230,8 @@ def _make_provider_for_model(config: Config, model: str):
 
 
 def _make_provider(config: Config):
-    """Create the main provider and optional tool_provider."""
-    model = config.agents.defaults.model
-    tool_model = config.agents.defaults.tool_model
-    provider = _make_provider_for_model(config, model)
-
-    # Build a separate provider for tool_model if it resolves to a different provider
-    tool_provider = None
-    if tool_model:
-        tp = _make_provider_for_model(config, tool_model)
-        # Always use separate provider when api_key or api_base differ
-        if (type(tp) is not type(provider)
-                or tp.api_key != provider.api_key
-                or tp.api_base != provider.api_base):
-            tool_provider = tp
-
-    return provider, tool_provider
+    """Create the configured LLM provider."""
+    return _make_provider_for_model(config, config.agents.defaults.model)
 
 
 # ============================================================================
@@ -282,7 +269,7 @@ def gateway(
         os.environ.setdefault("GROQ_API_KEY", config.providers.groq.api_key)
 
     bus = MessageBus()
-    provider, tool_provider = _make_provider(config)
+    provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
 
     # Connect PostgreSQL storage if configured
@@ -311,9 +298,6 @@ def gateway(
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
-        tool_model=config.agents.defaults.tool_model,
-        tool_provider=tool_provider,
-        auto_escalate=config.agents.defaults.auto_escalate,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
@@ -328,6 +312,7 @@ def gateway(
         storage=storage,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        transcription_config=config.transcription,
         parallel=config.agents.defaults.parallel,
         access=access,
     )
@@ -494,7 +479,7 @@ def agent(
         os.environ.setdefault("GROQ_API_KEY", config.providers.groq.api_key)
 
     bus = MessageBus()
-    provider, tool_provider = _make_provider(config)
+    provider = _make_provider(config)
 
     # Create cron service for tool usage (no callback needed for CLI unless running)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
@@ -519,9 +504,6 @@ def agent(
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
-        tool_model=config.agents.defaults.tool_model,
-        tool_provider=tool_provider,
-        auto_escalate=config.agents.defaults.auto_escalate,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
@@ -534,6 +516,7 @@ def agent(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        transcription_config=config.transcription,
         parallel=config.agents.defaults.parallel,
         access=access,
     )

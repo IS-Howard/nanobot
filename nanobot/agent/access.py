@@ -54,9 +54,10 @@ class AccessManager:
     def get_allowed_tools(self, sender_id: str) -> list[str] | None:
         """Return *None* (all) when no allowlist applies, else the allowlist.
 
-        Admins default to *None*; an admin who has configured a personal
-        self-allowlist (non-empty) gets that list applied to themselves only.
-        Normal users see the shared ``user_allowed_tools`` list.
+        Admins default to *None* (every tool enabled); an admin who has
+        configured a personal self-allowlist (non-empty) gets that list applied
+        to themselves only. Normal users see the shared ``user_allowed_tools``
+        list, which defaults to empty — i.e. no tools until an admin grants them.
         """
         if self.is_admin(sender_id):
             self_list = self._data.get("admin_self_allowed_tools", {}).get(sender_id)

@@ -663,7 +663,7 @@ Config file: `~/.nanobot/config.json`
 ### Providers
 
 > [!TIP]
-> - **Groq** provides free voice transcription via Whisper. If configured, Telegram voice messages will be automatically transcribed.
+> - **Voice transcription** works two ways: locally with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (offline, no API key — `pip install nanobot-ai[whisper]`), or via **Groq**'s hosted Whisper API. By default (`transcription.backend: "auto"`) nanobot uses local faster-whisper if installed, otherwise falls back to Groq. See [Voice transcription](#voice-transcription).
 > - **Zhipu Coding Plan**: If you're on Zhipu's coding plan, set `"apiBase": "https://open.bigmodel.cn/api/coding/paas/v4"` in your zhipu provider config.
 > - **MiniMax (Mainland China)**: If your API key is from MiniMax's mainland China platform (minimaxi.com), set `"apiBase": "https://api.minimaxi.com/v1"` in your minimax provider config.
 > - **VolcEngine Coding Plan**: If you're on VolcEngine's coding plan, set `"apiBase": "https://ark.cn-beijing.volces.com/api/coding/v3"` in your volcengine provider config.
@@ -929,6 +929,33 @@ The agent can also manage this file itself — ask it to "add a periodic task" a
 > **Note:** The gateway must be running (`nanobot gateway`) and you must have chatted with the bot at least once so it knows which channel to deliver to.
 
 </details>
+
+### Voice transcription
+
+nanobot transcribes voice/audio messages so the agent can "hear" them. Two backends are supported:
+
+- **Local (faster-whisper)** — fully offline, no API key, runs on your machine via [faster-whisper](https://github.com/SYSTRAN/faster-whisper). Install the extra:
+  ```bash
+  pip install nanobot-ai[whisper]
+  ```
+  The model is downloaded from Hugging Face once on first use, then cached for offline runs.
+- **Groq** — hosted Whisper API. Set your Groq key under `providers.groq.api_key`.
+
+Configure under the `transcription` section of `~/.nanobot/config.json`:
+
+```json
+{
+  "transcription": {
+    "backend": "auto",          // auto | local | groq
+    "model": "base",            // tiny | base | small | medium | large-v3
+    "device": "cpu",            // cpu | cuda | auto
+    "computeType": "int8",      // int8 (cpu) | float16 (gpu) | ...
+    "language": ""              // ISO code e.g. "en"; empty = auto-detect
+  }
+}
+```
+
+With `backend: "auto"` (the default), nanobot uses local faster-whisper when installed and falls back to Groq otherwise. Larger models are more accurate but slower and use more memory; `base` is a good default on CPU. For a GPU, set `device: "cuda"` and `computeType: "float16"`. All fields can also be set via env vars, e.g. `NANOBOT_TRANSCRIPTION__BACKEND=local`.
 
 ## 🐳 Docker
 

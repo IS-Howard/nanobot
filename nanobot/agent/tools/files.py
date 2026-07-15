@@ -12,8 +12,13 @@ from nanobot.agent.tools.base import Tool
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
-    from nanobot.providers.transcription import GroqTranscriptionProvider
+    from nanobot.providers.transcription import (
+        FasterWhisperTranscriptionProvider,
+        GroqTranscriptionProvider,
+    )
     from nanobot.storage.postgres import PostgresStorage
+
+    TranscriptionProvider = GroqTranscriptionProvider | FasterWhisperTranscriptionProvider
 
 
 class FileInfoTool(Tool):
@@ -84,7 +89,7 @@ class FileAnalysisTool(Tool):
         storage: PostgresStorage,
         provider: LLMProvider,
         model: str,
-        transcription: GroqTranscriptionProvider | None = None,
+        transcription: "TranscriptionProvider | None" = None,
     ):
         self._storage = storage
         self._provider = provider
@@ -134,10 +139,11 @@ class FileAnalysisTool(Tool):
     async def _analyze_audio(self, data: bytes, prompt: str) -> str:
         """Transcribe audio then analyze the text."""
         if not self._transcription:
-            return "Audio transcription not configured (need GROQ_API_KEY)."
+            return ("Audio transcription not configured — install faster-whisper for local "
+                    "transcription (pip install nanobot-ai[whisper]) or set GROQ_API_KEY.")
 
         try:
-            # Write to temp file for Groq Whisper API
+            # Write to a temp file for the transcription backend
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
             tmp.write(data)
             tmp.close()

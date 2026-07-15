@@ -1,6 +1,7 @@
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
+
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
@@ -40,7 +41,6 @@ class LineConfig(Base):
     quick_reply_actions: list[LineQuickReplyAction] = Field(
         default_factory=lambda: [
             LineQuickReplyAction(label="New", data="action=new"),
-            LineQuickReplyAction(label="Tool", data="action=tool"),
             LineQuickReplyAction(label="Attach", data="action=attach"),
             LineQuickReplyAction(label="Help", data="action=help"),
         ]
@@ -60,8 +60,6 @@ class AgentDefaults(Base):
 
     workspace: str = "~/.nanobot/workspace"
     model: str = "anthropic/claude-opus-4-5"
-    tool_model: str = ""  # Capable model with FC for auto-escalation (e.g. "gemini-2.0-flash")
-    auto_escalate: bool = True  # Auto-detect tool need and switch to tool_model
     provider: str = "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     max_tokens: int = 8192
     temperature: float = 0.1
@@ -161,6 +159,23 @@ class DatabaseConfig(Base):
     max_files_per_session: int = 2  # FIFO cleanup
 
 
+class TranscriptionConfig(Base):
+    """Audio/voice transcription configuration.
+
+    ``backend`` selects the transcription engine:
+      - ``auto``  : use local faster-whisper if installed, else Groq (default)
+      - ``local`` : force local faster-whisper (``pip install nanobot-ai[whisper]``)
+      - ``groq``  : force Groq's hosted Whisper API (requires GROQ_API_KEY)
+    """
+
+    backend: str = "auto"
+    model: str = "base"  # faster-whisper model size: tiny/base/small/medium/large-v3
+    device: str = "cpu"  # cpu / cuda / auto
+    compute_type: str = "int8"  # int8 (cpu) / float16 (gpu) / int8_float16 ...
+    language: str = ""  # ISO code (e.g. "en"); empty = auto-detect
+    cpu_threads: int = 0  # ctranslate2 CPU threads (0 = library default; ~8 is a good sweet spot)
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
@@ -170,6 +185,7 @@ class Config(BaseSettings):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+    transcription: TranscriptionConfig = Field(default_factory=TranscriptionConfig)
 
     @property
     def workspace_path(self) -> Path:
