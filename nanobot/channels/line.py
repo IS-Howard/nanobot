@@ -829,9 +829,13 @@ class LineChannel(BaseChannel):
             # Token consumed — agent response will be queued too
             reply_token = ""
 
-        # Show loading animation (fire-and-forget)
+        # Start the loading animation AND its keep-alive loop right away.
+        # Doing this at receipt (rather than waiting for iteration>=2's
+        # on_busy in the agent loop) means the first LLM call — often the
+        # longest with reasoning models — can't outlive the single 30s
+        # animation and leave a silent gap where "thinking" disappears.
         if msg_type == "text":
-            asyncio.create_task(self._show_loading(chat_id))
+            await self.show_busy(chat_id)
 
         if reply_token:
             self._reply_tokens[chat_id] = (reply_token, time.monotonic())
@@ -899,11 +903,12 @@ class LineChannel(BaseChannel):
             if not flushed and reply_token and chat_id in self._loading_tasks:
                 self._reply_tokens[chat_id] = (reply_token, time.monotonic())
                 self._schedule_processing_stub(chat_id)
-                # Bring back the loading dots immediately. The stub at t=18s
-                # had pushed a real message which made LINE drop the dots,
-                # and the keep-alive timer won't tick again for ~25s — that
-                # would leave a visible silent gap right after the user taps.
-                asyncio.create_task(self._show_loading(chat_id))
+                # Restart the keep-alive loop (not a one-shot show). The stub
+                # at t=18s had pushed a real message which made LINE drop the
+                # dots; a single _show_loading would flicker on then die at the
+                # next stub push. show_busy re-shows immediately AND keeps the
+                # dots alive continuously until the agent's real reply.
+                await self.show_busy(chat_id)
             return
         # Dynamic admin toggle commands
         if action in ("toggle_tool", "toggle_skill", "self_toggle_tool", "self_toggle_skill"):
@@ -1231,11 +1236,15 @@ class LineChannel(BaseChannel):
         self._cancel_loading(chat_id)
 
     async def _loading_keep_alive(self, chat_id: str) -> None:
-        """Repeatedly send loading animation every 25s until cancelled."""
+        """Repeatedly send loading animation until cancelled.
+
+        The animation lasts 30s; refresh at 20s (not 25s) so network jitter
+        or a slow loading-API call can't open a visible gap between refreshes.
+        """
         try:
             while True:
                 await self._show_loading(chat_id)
-                await asyncio.sleep(25)
+                await asyncio.sleep(20)
         except asyncio.CancelledError:
             pass
 
@@ -1268,6 +1277,10 @@ class LineChannel(BaseChannel):
             stub_msg: dict[str, Any] = {"type": "text", "text": "⏳ Processing…"}
             self._attach_quick_reply([stub_msg], chat_id, is_progress=True)
             await self._push_messages(chat_id, [stub_msg])
+            # Pushing a real message makes LINE drop the loading dots. Bring
+            # them straight back so "thinking" stays visible after the stub
+            # instead of freezing until the keep-alive's next ~20s tick.
+            await self._show_loading(chat_id)
         except asyncio.CancelledError:
             pass
 
